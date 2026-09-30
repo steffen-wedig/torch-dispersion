@@ -46,6 +46,7 @@ from .dipole import (
     trace_energy,
 )
 from .kernel import SRAccumulators, SRScalars, get_sr_step_fn, zero_sr_accumulators
+from .trace_grad import TraceGradients, trace_energy_and_grad
 
 
 @dataclass
@@ -123,9 +124,7 @@ def long_range_energy(
     assert nl is not None and grid is not None
     fractions, weights = q_grid(grid, positions.device)
     setup = EwaldSetup(positions, cell.to(f64), nl, g, k_cutoff)
-    # q-points in chunks that bound the memory of the batched matrices and traces
-    per_q = setup.bytes_per_q() + 16 * 3 * mu.shape[0] * (3 * setup.n) ** 2
-    chunk = max(1, min(fractions.shape[0], int(memory_budget // per_q)))
+    chunk = _chunk_size(setup, fractions.shape[0], mu.shape[0], memory_budget)
     energy = torch.zeros((), dtype=f64, device=positions.device)
     for start in range(0, fractions.shape[0], chunk):
         f, w = fractions[start : start + chunk], weights[start : start + chunk]
@@ -133,6 +132,38 @@ def long_range_energy(
     if correct_singularity:
         energy = energy - singular_correction(setup, fractions, weights, a, mu) / 18.0
     return energy
+
+
+def _chunk_size(setup: EwaldSetup, n_q: int, rank: int, memory_budget: float) -> int:
+    """q-points per batch that bound the memory of the batched matrices and traces."""
+    per_q = setup.bytes_per_q() + 16 * 3 * rank * (3 * setup.n) ** 2
+    return max(1, min(n_q, int(memory_budget // per_q)))
+
+
+def long_range_energy_analytic(
+    positions: Tensor,
+    cell: Tensor,
+    a: Tensor,
+    mu: Tensor,
+    nl,
+    g: float,
+    k_cutoff: float,
+    grid: tuple[int, int, int],
+    memory_budget: float = 2e9,
+) -> tuple[Tensor, TraceGradients]:
+    """Periodic undamped energy (without s9) split for the analytic backend: the grid trace
+    with explicit gradients (no autograd), and the q -> 0 correction as a differentiable
+    tensor (autograd through ``a``, positions and cell). Energy = correction + grads.energy."""
+    f64 = torch.float64
+    positions, cell = positions.to(f64), cell.to(f64)
+    fractions, weights = q_grid(grid, positions.device)
+    with torch.no_grad():
+        setup = EwaldSetup(positions.detach(), cell.detach(), nl, g, k_cutoff)
+        chunk = _chunk_size(setup, fractions.shape[0], mu.shape[0], memory_budget)
+        grads = trace_energy_and_grad(setup, fractions, weights, a.detach(), mu, chunk)
+    graph_setup = EwaldSetup(positions, cell, nl, g, k_cutoff)
+    correction = -singular_correction(graph_setup, fractions, weights, a, mu) / 18.0
+    return correction, grads
 
 
 def separable_c9(
@@ -273,39 +304,55 @@ def fourier_atm(
     )
     e_sr = acc.energy if isinstance(acc, SRAccumulators) else acc
 
-    # stage 3: dense trace (float64) with autograd through a, positions and cell
+    # stage 3: dense trace (float64); gradients by autograd through a, positions and cell, or
+    # (``trace_gradient="analytic"``, periodic) explicitly, with only the q -> 0 correction on
+    # autograd
     grid = None
+    explicit: TraceGradients | None = None
+    mu64 = fit.weights.to(device)
     with torch.set_grad_enabled(need_grad):
         if pbc:
             assert cell_s is not None and cell_b is not None
             grid = settings.q_grid or grid_for_cell(cell_b, settings.supercell_length_bohr)
             g, k_cut = ewald_parameters(r_ew, settings.ewald_accuracy)
             nl_ew = restricted(r_ew)
-            e_tr = long_range_energy(
-                pos_s, cell_s, a[:n], fit.weights.to(device), nl_ew, g, k_cut, grid
-            )
+            if settings.trace_gradient == "analytic" and need_grad:
+                e_tr, explicit = long_range_energy_analytic(
+                    pos_s, cell_s, a[:n], mu64, nl_ew, g, k_cut, grid
+                )
+            else:
+                e_tr = long_range_energy(pos_s, cell_s, a[:n], mu64, nl_ew, g, k_cut, grid)
         else:
-            e_tr = long_range_energy(pos_s, None, a[:n], fit.weights.to(device))
+            e_tr = long_range_energy(pos_s, None, a[:n], mu64)
         e_tr = settings.s9 * e_tr
 
     forces = stress = virial_out = None
     if need_grad:
         assert isinstance(acc, SRAccumulators)
+        grad_pos, virial, grad_a = acc.grad_pos[:n], acc.virial, acc.grad_a
+        if explicit is not None:
+            s9 = settings.s9
+            grad_pos = grad_pos + s9 * explicit.grad_pos
+            virial = virial + s9 * explicit.virial
+            grad_a = grad_a.clone()
+            grad_a[:n] += s9 * explicit.grad_a
         leaves = [pos_leaf] if compute_forces else []
         leaves += [strain] if compute_stress else []
-        total = e_tr + (c6 * acc.grad_c6.to(c6.dtype)).sum() + (a * acc.grad_a.to(a.dtype)).sum()
+        total = e_tr + (c6 * acc.grad_c6.to(c6.dtype)).sum() + (a * grad_a.to(a.dtype)).sum()
         grads = torch.autograd.grad(total, leaves, allow_unused=True)
         grads = [
             torch.zeros_like(x) if g is None else g for x, g in zip(leaves, grads, strict=True)
         ]
         if compute_forces:
-            gradient = acc.grad_pos[:n] + grads.pop(0).to(f64)
+            gradient = grad_pos + grads.pop(0).to(f64)
             forces = -gradient * (hartree / bohr)
         if compute_stress:
             assert cell is not None
-            virial_out = (acc.virial + grads.pop(0).to(f64)) * hartree
+            virial_out = (virial + grads.pop(0).to(f64)) * hartree
             volume = torch.linalg.det(torch.as_tensor(cell).to(device=device, dtype=f64)).abs()
             stress = 0.5 * (virial_out + virial_out.T) / volume
+    if explicit is not None:
+        e_tr = e_tr + settings.s9 * explicit.energy
     e_tr = e_tr.detach()
     return FourierATMResult(
         energy=(e_tr + e_sr) * hartree,

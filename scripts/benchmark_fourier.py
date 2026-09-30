@@ -69,6 +69,7 @@ def main() -> None:
         print(json.dumps(row), flush=True)
 
     fourier = {c: FourierATMSettings(coordination=c) for c in ("d3", "smooth_cut")}
+    fourier_autograd = FourierATMSettings(trace_gradient="autograd")
     real = {c: ATMSettings(three_body_cutoff_bohr=c) for c in (25.0, 40.0)}
     for name, atoms in structures.items():
         if "liquid" not in name:
@@ -105,6 +106,7 @@ def main() -> None:
             break
         for label, fn, settings in [
             ("fourier_smoothcn", fourier_atm, fourier["smooth_cut"]),
+            ("fourier_smoothcn_autograd", fourier_atm, fourier_autograd),
             ("real_25", atm_dispersion, real[25.0]),
             ("real_40", atm_dispersion, real[40.0]),
         ]:

@@ -87,15 +87,26 @@ def molecular_dipole_matrix(positions: Tensor) -> Tensor:
     return t.permute(0, 2, 1, 3).reshape(3 * n, 3 * n)
 
 
+def erfc_radial(r: Tensor, g: float) -> tuple[Tensor, Tensor, Tensor]:
+    """The Ewald radial functions B, C, D of erfc(g r) / r (B' = -r C, C' = -r D):
+
+    B = [erfc + G] / r^3, C = [3 erfc + G (3 + 2 x^2)] / r^5,
+    D = [15 erfc + G (15 + 10 x^2 + 4 x^4)] / r^7,  x = g r, G = 2 x exp(-x^2) / sqrt(pi).
+    """
+    r2 = r * r
+    x = g * r
+    x2 = x * x
+    gauss = (2.0 / math.sqrt(math.pi)) * x * torch.exp(-x2)
+    erfc = torch.special.erfc(x)
+    b = (erfc + gauss) / (r2 * r)
+    c = (3.0 * erfc + gauss * (3.0 + 2.0 * x2)) / (r2 * r2 * r)
+    d = (15.0 * erfc + gauss * (15.0 + x2 * (10.0 + 4.0 * x2))) / (r2 * r2 * r2 * r)
+    return b, c, d
+
+
 def _erfc_tensor(vec: Tensor, g: float) -> Tensor:
     """grad grad (erfc(g r) / r) = C r r^T - B 1."""
-    r2 = vec.square().sum(-1)
-    r = torch.sqrt(r2)
-    gr = g * r
-    gauss = (2.0 / math.sqrt(math.pi)) * gr * torch.exp(-gr * gr)
-    erfc = torch.special.erfc(gr)
-    b = (erfc + gauss) / (r2 * r)
-    c = (3.0 * erfc + gauss * (3.0 + 2.0 * gr * gr)) / (r2 * r2 * r)
+    b, c, _ = erfc_radial(torch.sqrt(vec.square().sum(-1)), g)
     eye = torch.eye(3, dtype=vec.dtype, device=vec.device)
     outer = vec[..., :, None] * vec[..., None, :]
     return c[..., None, None] * outer - b[..., None, None] * eye
@@ -123,6 +134,7 @@ class EwaldSetup:
         vec = nl.vectors(positions, cell)  # (N, M, 3), zero in padding
         safe = torch.where(nl.mask[..., None], vec, 1.0)
         self.t_real = torch.where(nl.mask[..., None, None], _erfc_tensor(safe, g), 0.0)
+        self.vec = vec
         self.nl = nl
 
         # reciprocal lattice (rows b_i, a_i . b_j = 2 pi delta_ij) and the integer G-vectors
@@ -140,36 +152,46 @@ class EwaldSetup:
         self.positions = positions
         self.k_cutoff = k_cutoff
 
-    def matrices(self, q_frac: Tensor) -> Tensor:
-        """A(q) (n_q, 3N, 3N) complex for fractional q (n_q, 3)."""
+    def real_part(self, q_frac: Tensor) -> tuple[Tensor, Tensor]:
+        """(real-space A (n_q, 3N, 3N), phases (N, M, n_q)) for fractional q (n_q, 3)."""
         n, n_q = self.n, q_frac.shape[0]
         dtype = torch.complex128
-        # real space: phase e^{2 pi i f . s} of the integer image shift s
+        # phase e^{2 pi i f . s} of the integer image shift s
         phase = torch.exp(2j * math.pi * (self.nl.shifts.to(torch.float64) @ q_frac.T))
         vals = self.t_real.reshape(n, -1, 1, 9).to(dtype) * phase[..., None]  # (N, M, n_q, 9)
         vals = vals.permute(2, 0, 1, 3)
         idx = self.nl.indices[None, :, :, None].expand(n_q, -1, -1, 9)
         real = torch.zeros(n_q, n, n + 1, 9, dtype=dtype, device=vals.device)
         real = real.scatter_add(2, idx, vals)[:, :, :n].reshape(n_q, n, n, 3, 3)
-        real = real.permute(0, 1, 3, 2, 4).reshape(n_q, 3 * n, 3 * n)
+        return real.permute(0, 1, 3, 2, 4).reshape(n_q, 3 * n, 3 * n), phase
 
-        # reciprocal space: k = (m - q) . b with 0 < |k| <= k_cutoff (weight 0 elsewhere; k = 0
-        # occurs only at q = 0, and dropping it there gives the regular part A_r(0) used by
-        # ``singular_correction``)
+    def reciprocal_factors(self, q_frac: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """(k (n_q, n_k, 3), h (n_q, n_k), e (n_q, n_k, N), W (n_q, n_k, 3N)) with
+        W_(k, jb) = h_k k_b e^{i k . x_j}, h_k = sqrt(4 pi / V exp(-k^2 / 4 g^2) / k^2), so the
+        reciprocal part is -W^H W. k = (m - q) . b; h = 0 outside 0 < |k| <= k_cutoff (k = 0
+        occurs only at q = 0, and dropping it there gives the regular part A_r(0) used by
+        ``singular_correction``)."""
+        n, n_q = self.n, q_frac.shape[0]
         k = (self.m[None] - q_frac[:, None, :]) @ self.recip  # (n_q, n_k, 3)
         k2 = k.square().sum(-1)
         keep = (k2.detach() > 1e-24) & (k2.detach() <= self.k_cutoff**2)
         k2_safe = torch.where(keep, k2, 1.0)
         c = (4.0 * math.pi / self.volume) * torch.exp(-k2_safe / (4.0 * self.g**2)) / k2_safe
-        weight = torch.where(keep, torch.sqrt(c), 0.0)
-        e = torch.exp(1j * (k @ self.positions.T))  # (n_q, n_k, N): e^{i k . x_j}
-        w = (weight[..., None] * k).to(dtype)[:, :, None, :] * e[..., None]  # (n_q, n_k, N, 3)
-        w = w.reshape(n_q, -1, 3 * n)
-        rec = -(w.conj().transpose(1, 2) @ w)  # sum_k c k_a k_b e^{-i k x_i} e^{i k x_j}
+        h = torch.where(keep, torch.sqrt(c), 0.0)
+        e = torch.exp(1j * (k @ self.positions.T))  # e^{i k . x_j}
+        w = (h[..., None] * k).to(torch.complex128)[:, :, None, :] * e[..., None]
+        return k, h, e, w.reshape(n_q, -1, 3 * n)
 
-        self_term = 4.0 * self.g**3 / (3.0 * math.sqrt(math.pi))
-        eye = torch.eye(3 * n, dtype=dtype, device=vals.device)
-        return real + rec + self_term * eye
+    def self_term(self) -> float:
+        return 4.0 * self.g**3 / (3.0 * math.sqrt(math.pi))
+
+    def matrices(self, q_frac: Tensor) -> Tensor:
+        """A(q) (n_q, 3N, 3N) complex for fractional q (n_q, 3)."""
+        real, _ = self.real_part(q_frac)
+        w = self.reciprocal_factors(q_frac)[3]
+        rec = -(w.conj().transpose(1, 2) @ w)  # sum_k c k_a k_b e^{-i k x_i} e^{i k x_j}
+        eye = torch.eye(3 * self.n, dtype=real.dtype, device=real.device)
+        return real + rec + self.self_term() * eye
 
     def matrix(self, q_frac: Tensor) -> Tensor:
         """A(q) (3N, 3N) for one fractional q (3,)."""

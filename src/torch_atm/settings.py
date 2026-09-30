@@ -109,6 +109,11 @@ class FourierATMSettings(_KernelSettings):
     liquids (H200) 20 / 25 / 30 bohr take 0.076 / 0.058 / 0.052 s for energy, forces, stress."""
     ewald_accuracy: float = Field(default=1e-10, gt=0, lt=1)
     """Sets the splitting g = sqrt(-ln acc) / real cutoff and the k cutoff 2 g sqrt(-ln acc)."""
+    trace_gradient: Literal["analytic", "autograd"] = "analytic"
+    """Gradients of the periodic trace: hand-written (``fourier/trace_grad.py``; the q -> 0
+    correction stays on autograd) or autograd (the reference; they agree to ~1e-14). Analytic is
+    1.3-1.6x faster with 2-2.5x less peak memory from 512 atoms (H200). Molecules always use
+    autograd."""
     q_grid: tuple[int, int, int] | None = None
     """Bloch grid; None: the smallest grid whose supercell is ``supercell_length_bohr`` wide."""
     supercell_length_bohr: float = Field(default=70.0, gt=0)

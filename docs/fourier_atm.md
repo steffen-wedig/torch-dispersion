@@ -85,7 +85,14 @@ E = E_bare + Σ_{legs ≤ r_s} [C9_D3 fdmp − C9_CP] ang s(r_ij) s(r_ik) s(r_jk
 
 - **Stage 1:** CN → weights → C6 and a, with autograd.
 - **Stage 2:** the short-range tiles on detached C6 and a. They accumulate dE/dR, the virial, dE/dC6 and dE/da.
-- **Stage 3:** the trace (float64) with autograd through a, the positions and the cell (the strain trick). One `autograd.grad` closes both chains.
+- **Stage 3:** the periodic trace, with explicit gradients (`trace_gradient="analytic"`, the default, in `fourier/trace_grad.py`):
+  - **Trace:** dE/dA = Γ = −(w_q/6) Σ_r μ_r (M_r² D_r)ᵀ, and dE/da from 3·diag(A M²). Both reuse M² from the forward pass.
+  - **Real space:** H_im = Re Σ_q Γ[(i,:),(j_m,:)]·phase contracts with the erfc dipole tensor through the Ewald radial functions B, C, D: dE/dv = −D (v·Hv) v + C (H + Hᵀ) v + C tr(H) v.
+  - **Reciprocal space:** one matmul, Z = conj(W)(Γ + Γ^H). The forces are Σ_k k·Im(W∘Z). Under strain, the phases k·x are invariant and only h_k and k change, which gives a closed-form virial.
+  - **q → 0 correction:** the only part left on autograd. It needs one extra matrix.
+  - **Reference backend:** `trace_gradient="autograd"`. The two agree to ~1e-14 in forces and ~1e-13 in the virial.
+  - **Molecules:** always autograd.
+- **Closing the chain:** one `autograd.grad` closes the CN → C6/a chain for both parts.
 
 ## 2. Accuracy
 
@@ -94,13 +101,26 @@ E = E_bare + Σ_{legs ≤ r_s} [C9_D3 fdmp − C9_CP] ang s(r_ij) s(r_ik) s(r_jk
 - With r_s larger than the molecule, the result equals the real-space D3 at 60 bohr to 1e-10 relative, and forces to 1e-12.
 - With finite r_s, it matches a brute-force triangle sum of the same definition to 1e-11.
 
-**Periodic, against brute force.** A monomer in a 16 × 17 × 18 Å box, compared with the real-space triangle sum of the same definition at 120 bohr. This comparison is absolute because the total is a 400× cancellation:
+**Periodic, against brute force.** A benzamide monomer in sparse boxes, compared with the real-space triangle sum of the same definition at 90–120 bohr (converged to ~1e-7 eV). The comparison is absolute because the total is a ~400× cancellation. Errors in eV:
 
-| q-grid | error (eV) |
-|---|---|
-| 2³ | 2.0e-5 |
-| 3³ | 2.5e-6 |
-| 4³ | 6e-7 |
+| box (Å, °) | 2³ | 3³ | 4³ |
+|---|---|---|---|
+| orthorhombic 16 × 17 × 18 | 2.0e-5 | 2.5e-6 | 6e-7 |
+| triclinic 16, 17, 18; 70, 80, 110 | 5.6e-5 | 7.6e-6 | 1.7e-6 |
+| hexagonal 16, 16, 18; 90, 90, 120 | 1.4e-4 | 2.1e-5 | 4.6e-6 |
+| elongated 13 × 16 × 26 | 1.5e-5 | 4.8e-6 | 2.8e-6 |
+| skewed 15, 16, 17; 60, 65, 70 | 5.3e-5 | 5.3e-6 | 1.0e-6 |
+
+In skewed cells the raw Γ jump is about 20× larger: the grid points next to Γ lie in anisotropic Cartesian directions. The correction still removes the leading term. The corrected error falls off roughly as n⁻⁵ in every box, 12–150× below the uncorrected error. At the default 3³ grid these boxes are within 2e-5 eV for 16 atoms, about 1e-3 meV/atom.
+
+**Non-cubic tests.** The tests cover the following on hexagonal, triclinic and strongly skewed cells:
+
+- Ewald splitting independence and Hermiticity;
+- the supercell identity on anisotropic grids;
+- convergence of the q → 0 correction;
+- brute-force energies in the five boxes above;
+- finite-difference forces and full virials with both trace backends;
+- rotation invariance of energy, forces and virial.
 
 **Liquids, against the real-space D3 at 80 bohr** (D3 CN, meV/atom). Reference totals are 2.46–3.60 meV/atom. The 80-bohr sum still lacks about +0.0013 meV/atom of tail:
 
@@ -121,16 +141,17 @@ What the table shows:
 
 ## 3. Performance
 
-H200, 250-atom liquids, compiled, energy + forces + stress:
+H200, float64, compiled, energy + forces + stress. Full tables: [`benchmark_fourier.md`](benchmark_fourier.md).
 
-| method | time |
-|---|---|
-| FourierATM, defaults | ≈ 0.05 s |
-| real-space ATM at 40 bohr | 0.33 s |
-| real-space ATM at 25 bohr | 0.04 s |
+| atoms | FourierATM (analytic) | FourierATM (autograd) | real 40 bohr | real 25 bohr |
+|---|---|---|---|---|
+| 256 | 0.053 s | 0.054 s | 0.31 s | 0.033 s |
+| 512 | 0.124 s | 0.158 s | 0.80 s | 0.082 s |
+| 1024 | 0.42 s | 0.63 s | 2.5 s | 0.25 s |
+| 2048 | 1.9 s | 3.0 s | 11.1 s | 1.06 s |
 
 - **Where the time goes:** the trace (complex float64 GEMMs) dominates. The Ewald real-space cutoff trades k-vectors for pairs. On the 250-atom liquids, energy + forces + stress took 0.076 s at 20 bohr, 0.058 s at 25 bohr and 0.052 s at 30 bohr (the default).
-- **Scaling:** the dense trace is O(N_q N³). The grid shrinks as the box grows (N_q ∝ 1/N), so at fixed accuracy the cost grows as about N². Measured scaling: see `docs/benchmark_fourier.md` (`scripts/benchmark_fourier.py`).
+- **Scaling:** the dense trace is O(N_q N³). The grid shrinks with the box (N_q ∝ 1/N), so the cost grows as about N². Peak memory is 2.5 GiB at 256–512 atoms and 14 GiB at 2048 atoms with the analytic backend; autograd needs twice that.
 
 ## 4. Settings (`FourierATMSettings`)
 
@@ -140,7 +161,8 @@ H200, 250-atom liquids, compiled, energy + forces + stress:
 | `short_range_cutoff_bohr`, `short_range_width_bohr` | 20, 3 | exact-damping region and its switch |
 | `cp_rank` | 2 | terms of the separable C9 (max relative error 2–4e-3; higher ranks barely help) |
 | `ewald_real_cutoff_bohr`, `ewald_accuracy` | 30, 1e-10 | Ewald split |
-| `q_grid`, `supercell_length_bohr` | None, 70 | explicit grid, or the grid rule |
+| `q_grid`, `supercell_length_bohr` | None, 70 | explicit grid, or the grid rule (n ≥ 2 per direction; uses lattice-plane spacings) |
+| `trace_gradient` | analytic | explicit trace gradients, or `autograd` (reference) |
 
 ## 5. Known limitations
 

@@ -70,7 +70,7 @@ result = fourier_atm(numbers, positions, cell, pbc=True, settings=settings)
 atoms.calc = TorchATMCalculator(settings)  # same calculator, dispatches on the settings
 ```
 
-On the 250-atom liquids (H200), energy + forces + stress take about 0.05 s. The real-space term takes 0.33 s at 40 bohr.
+On an H200, energy + forces + stress take 0.05 s for the 250-atom liquids and 1.9 s at 2048 atoms. The real-space term at 40 bohr takes 0.31 s and 11 s. Details: [`docs/benchmark_fourier.md`](docs/benchmark_fourier.md).
 
 FourierATM is within 0.001–0.006 meV/atom of the real-space sum at 80 bohr. The 40-bohr sum (which the FHI-aims labels use) is 0.007–0.014 below it.
 

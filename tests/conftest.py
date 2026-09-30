@@ -233,11 +233,23 @@ def run_fourier(atoms: Atoms, settings, **kwargs):
     )
 
 
-def monomer_in_box(name="benzamide_monomer_C7H7NO", box=(16.0, 17.0, 18.0)) -> Atoms:
-    """A fixture monomer in an orthorhombic cell (Å): periodic but sparse, so the brute-force
+# cell parameters (Å, degrees) of the sparse test boxes
+BOXES = {
+    "orthorhombic": (16.0, 17.0, 18.0, 90.0, 90.0, 90.0),
+    "triclinic": (16.0, 17.0, 18.0, 70.0, 80.0, 110.0),
+    "hexagonal": (16.0, 16.0, 18.0, 90.0, 90.0, 120.0),
+    "elongated": (13.0, 16.0, 26.0, 90.0, 90.0, 90.0),
+    "skewed": (15.0, 16.0, 17.0, 60.0, 65.0, 70.0),
+}
+
+
+def monomer_in_box(name="benzamide_monomer_C7H7NO", box="orthorhombic") -> Atoms:
+    """A fixture monomer centred in one of ``BOXES``: periodic but sparse, so the brute-force
     triangle sum converges at affordable cutoffs."""
+    from ase.geometry import cellpar_to_cell
+
     atoms = structures()[name].copy()
-    atoms.cell = list(box)
+    atoms.cell = cellpar_to_cell(BOXES[box])
     atoms.pbc = True
-    atoms.center()
+    atoms.positions += atoms.cell.array.sum(0) / 2 - atoms.positions.mean(0)
     return atoms

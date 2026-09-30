@@ -76,6 +76,26 @@ def test_periodic_brute_force_coarse():
     assert abs(got - reference_energy(atoms, fs, cutoff=90.0)) < 5e-6
 
 
+# measured |FourierATM - brute force| (eV) on the 4^3 grid: triclinic 1.7e-6, hexagonal 4.6e-6,
+# elongated 2.8e-6, skewed 1.0e-6 (the 90-bohr reference is converged to ~1e-7)
+@pytest.mark.parametrize("box", ["triclinic", "hexagonal", "elongated", "skewed"])
+def test_periodic_brute_force_noncubic(box):
+    atoms = monomer_in_box(box=box)
+    fs = make_fourier_settings(coordination="d3", q_grid=(4, 4, 4))
+    got = periodic_brute_force_short(atoms, fs)
+    assert abs(got - reference_energy(atoms, fs, cutoff=90.0)) < 1e-5
+
+
+@pytest.mark.parametrize("box", ["hexagonal", "skewed"])
+def test_periodic_grid_rule_noncubic(box):
+    """The default grid rule (plane spacings) on skewed boxes: 3^3 here, within 3e-5 eV."""
+    atoms = monomer_in_box(box=box)
+    fs = make_fourier_settings(coordination="d3")
+    got = run_fourier(atoms, fs, compute_forces=False, compute_stress=False)
+    assert got.q_grid == (3, 3, 3)
+    assert abs(float(got.energy) - reference_energy(atoms, fs, cutoff=90.0)) < 3e-5
+
+
 def fd_check(atoms, fs, indices=(0, 3, 7)):
     result = run_fourier(atoms, fs)
 
@@ -111,10 +131,88 @@ SMALL = {
 }
 
 
+@pytest.mark.parametrize("trace", ["autograd", "analytic"])
 @pytest.mark.parametrize("gradient", ["analytic", "vjp"])
-def test_derivatives_periodic(gradient):
+def test_derivatives_periodic(gradient, trace):
     """Smooth CN, so central differences are exact to O(h^2)."""
-    fd_check(structures()["dmso_crystal"], make_fourier_settings(kernel_gradient=gradient, **SMALL))
+    fs = make_fourier_settings(kernel_gradient=gradient, trace_gradient=trace, **SMALL)
+    fd_check(structures()["dmso_crystal"], fs)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("coordination", ["smooth_cut", "d3"])
+@pytest.mark.parametrize("name", ["dmso_crystal", "emim_ntf2_crystal", "benzamide_crystal"])
+def test_trace_gradient_backends_agree(name, coordination, device):
+    """Hand-written trace gradients against autograd (energy identical, forces and virial to
+    rounding); a triclinic 3x2x2 grid exercises the odd, self-conjugate q-points."""
+    atoms = structures()[name]
+    common = dict(SMALL, q_grid=(3, 2, 2), coordination=coordination)
+    ref = run_fourier(atoms, make_fourier_settings(device, trace_gradient="autograd", **common))
+    got = run_fourier(atoms, make_fourier_settings(device, trace_gradient="analytic", **common))
+    assert float(got.energy) == pytest.approx(float(ref.energy), rel=1e-13)
+    torch.testing.assert_close(got.forces, ref.forces, rtol=0, atol=1e-13)
+    torch.testing.assert_close(got.virial, ref.virial, rtol=0, atol=1e-12)
+
+
+def test_trace_gradient_triclinic_random():
+    from ase.geometry import cellpar_to_cell
+    from conftest import random_cell
+
+    atoms = random_cell(7, seed=5, cell_lengths=(6.0, 7.0, 8.0), angles=(75, 100, 110))
+    atoms.set_cell(cellpar_to_cell([6.0, 7.0, 8.0, 75, 100, 110]), scale_atoms=True)
+    common = dict(SMALL, q_grid=(2, 3, 2))
+    ref = run_fourier(atoms, make_fourier_settings(trace_gradient="autograd", **common))
+    got = run_fourier(atoms, make_fourier_settings(trace_gradient="analytic", **common))
+    torch.testing.assert_close(got.forces, ref.forces, rtol=0, atol=1e-13)
+    torch.testing.assert_close(got.virial, ref.virial, rtol=0, atol=1e-12)
+
+
+NONCUBIC = {
+    "hexagonal": (6.0, 6.0, 7.0, 90.0, 90.0, 120.0),
+    "triclinic": (6.0, 7.0, 8.0, 75.0, 100.0, 110.0),
+    "skewed": (6.5, 7.0, 7.5, 60.0, 65.0, 70.0),
+}
+
+
+def noncubic_cell(kind: str, n: int = 6, seed: int = 3):
+    from conftest import random_cell
+
+    par = NONCUBIC[kind]
+    return random_cell(n, seed=seed, cell_lengths=par[:3], angles=par[3:])
+
+
+@pytest.mark.parametrize("trace", ["autograd", "analytic"])
+@pytest.mark.parametrize("kind", list(NONCUBIC))
+def test_derivatives_noncubic(kind, trace):
+    """Forces and the full (non-symmetric) virial against finite differences on hexagonal,
+    triclinic and strongly skewed cells, with both trace backends."""
+    fs = make_fourier_settings(trace_gradient=trace, **SMALL)
+    fd_check(noncubic_cell(kind), fs, indices=(0, 2, 5))
+
+
+def random_rotation(seed: int) -> np.ndarray:
+    q, r = np.linalg.qr(np.random.default_rng(seed).normal(size=(3, 3)))
+    q = q * np.sign(np.diag(r))
+    return q if np.linalg.det(q) > 0 else -q
+
+
+@pytest.mark.parametrize("trace", ["autograd", "analytic"])
+@pytest.mark.parametrize("name", ["dmso_crystal", "emim_ntf2_crystal"])
+def test_rotation_invariance(name, trace):
+    """Rotating a triclinic cell with its atoms (rows: x -> x Q): same energy, forces F Q,
+    virial Q^T V Q. The Ewald k-sets, the grid and the anisotropic q -> 0 correction all rotate
+    with the cell, so this checks that nothing is tied to the Cartesian axes."""
+    atoms = structures()[name]
+    q = random_rotation(7)
+    rotated = atoms.copy()
+    rotated.set_cell(atoms.cell.array @ q, scale_atoms=False)
+    rotated.positions = atoms.positions @ q
+    fs = make_fourier_settings(trace_gradient=trace, **SMALL)
+    ref, got = run_fourier(atoms, fs), run_fourier(rotated, fs)
+    assert float(got.energy) == pytest.approx(float(ref.energy), rel=1e-12)
+    qt = torch.tensor(q)
+    torch.testing.assert_close(got.forces, ref.forces @ qt, rtol=0, atol=1e-13)
+    torch.testing.assert_close(got.virial, qt.T @ ref.virial @ qt, rtol=0, atol=1e-12)
 
 
 def test_derivatives_molecule():

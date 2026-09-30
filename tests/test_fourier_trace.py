@@ -47,11 +47,19 @@ def test_trace_identity_molecule():
     assert got == pytest.approx(brute_force_undamped(pos, a, mu), rel=1e-13)
 
 
-def random_periodic(n=5, seed=0):
+# near-orthorhombic, hexagonal and strongly skewed test cells (bohr)
+CELLS = {
+    "near_orthorhombic": [[9.0, 0.3, 0.0], [0.5, 10.0, 0.2], [0.0, -0.4, 11.0]],
+    "hexagonal": [[10.0, 0.0, 0.0], [-5.0, 8.660254037844386, 0.0], [0.0, 0.0, 11.0]],
+    "skewed": [[9.0, 0.0, 0.0], [4.5, 8.0, 0.0], [3.0, 4.0, 9.5]],
+}
+
+
+def random_periodic(n=5, seed=0, cell="near_orthorhombic"):
     g = torch.Generator().manual_seed(seed)
-    cell = torch.tensor([[9.0, 0.3, 0.0], [0.5, 10.0, 0.2], [0.0, -0.4, 11.0]], dtype=F64)
-    pos = torch.rand(n, 3, generator=g, dtype=F64) @ cell
-    return pos, cell
+    lattice = torch.tensor(CELLS[cell], dtype=F64)
+    pos = torch.rand(n, 3, generator=g, dtype=F64) @ lattice
+    return pos, lattice
 
 
 def bloch(pos, cell, real_cutoff, q):
@@ -60,16 +68,18 @@ def bloch(pos, cell, real_cutoff, q):
     return EwaldSetup(pos, cell, nl, g, k_cut).matrix(torch.tensor(q, dtype=F64))
 
 
-def test_ewald_splitting_independence():
+@pytest.mark.parametrize("cell", list(CELLS))
+def test_ewald_splitting_independence(cell):
     """A(q) must not depend on the real/reciprocal split (catches self and k-space terms)."""
-    pos, cell = random_periodic()
+    pos, cell = random_periodic(cell=cell)
     q = [0.25, 0.1, -0.3]
     a1, a2 = bloch(pos, cell, 20.0, q), bloch(pos, cell, 30.0, q)
     assert float((a1 - a2).abs().max()) < 1e-14 * float(a1.abs().max()) * 1e3
 
 
-def test_bloch_hermitian_and_time_reversal():
-    pos, cell = random_periodic()
+@pytest.mark.parametrize("cell", list(CELLS))
+def test_bloch_hermitian_and_time_reversal(cell):
+    pos, cell = random_periodic(cell=cell)
     a = bloch(pos, cell, 20.0, [0.25, 0.1, -0.3])
     b = bloch(pos, cell, 20.0, [-0.25, -0.1, 0.3])
     scale = float(a.abs().max())
@@ -77,20 +87,27 @@ def test_bloch_hermitian_and_time_reversal():
     assert float((b - a.conj()).abs().max()) < 1e-15 * scale * 1e2
 
 
-def test_supercell_identity():
-    """Shifted n^3 grid of the cell = the n^3 supercell at its zone-boundary q, per cell."""
-    pos, cell = random_periodic()
+@pytest.mark.parametrize(
+    ("cell", "grid"),
+    [("near_orthorhombic", (2, 2, 2)), ("hexagonal", (2, 3, 1)), ("skewed", (1, 2, 3))],
+)
+def test_supercell_identity(cell, grid):
+    """Shifted n1 x n2 x n3 grid of the cell = the n1 x n2 x n3 supercell at its zone-boundary
+    q, per cell (checks the Bloch phases, the image sums and the grid reduction)."""
+    pos, cell = random_periodic(cell=cell)
     g = torch.Generator().manual_seed(1)
     a = torch.rand(pos.shape[0], 2, generator=g, dtype=F64)
     mu = torch.tensor([0.7, -0.2], dtype=F64)
-    fractions, weights = q_grid((2, 2, 2), pos.device)
+    fractions, weights = q_grid(grid, pos.device)
     mats = torch.stack([bloch(pos, cell, 20.0, f.tolist()) for f in fractions])
     per_cell = float(trace_energy(mats, weights, a, mu))
-    shifts = torch.tensor(list(itertools.product(range(2), repeat=3)), dtype=F64)
+    n_cells = math.prod(grid)
+    shifts = torch.tensor(list(itertools.product(*(range(m) for m in grid))), dtype=F64)
     big = torch.cat([pos + s @ cell for s in shifts])
-    sc = bloch(big, 2 * cell, 20.0, [0.5, 0.5, 0.5])[None]
-    supercell = float(trace_energy(sc, torch.ones(1, dtype=F64), a.repeat(8, 1), mu)) / 8
-    assert per_cell == pytest.approx(supercell, rel=1e-12)
+    super_cell = torch.tensor(grid, dtype=F64)[:, None] * cell
+    sc = bloch(big, super_cell, 20.0, [0.5, 0.5, 0.5])[None]
+    supercell = float(trace_energy(sc, torch.ones(1, dtype=F64), a.repeat(n_cells, 1), mu))
+    assert per_cell == pytest.approx(supercell / n_cells, rel=1e-12)
 
 
 @pytest.mark.parametrize("n", [(1, 1, 1), (2, 2, 2), (3, 2, 1), (4, 4, 3)])
@@ -104,11 +121,19 @@ def test_q_grid(n):
 def test_grid_for_cell():
     cell = torch.diag(torch.tensor([20.0, 30.0, 70.0], dtype=F64))
     assert grid_for_cell(cell, 70.0) == (4, 3, 2)
+    # the rule uses lattice-plane spacings, not vector lengths: shearing b along a leaves |a|
+    # at 20 but brings the a-planes to 20 / sqrt(2)
+    sheared = torch.tensor([[20.0, 0.0, 0.0], [30.0, 30.0, 0.0], [0.0, 0.0, 70.0]], dtype=F64)
+    spacing_a = 20.0 / math.sqrt(2.0)  # plane spacing of the a-planes shrinks with the shear
+    assert grid_for_cell(sheared, 70.0) == (math.ceil(70.0 / spacing_a), 3, 2)
 
 
-def test_singular_correction_convergence():
-    """The q -> 0 correction turns the O(1/N_q) grid error into a much smaller one."""
-    atoms = monomer_in_box()
+@pytest.mark.parametrize("box", ["orthorhombic", "hexagonal", "skewed"])
+def test_singular_correction_convergence(box):
+    """The q -> 0 correction turns the O(1/N_q) grid error into a much smaller one. In skewed
+    cells the jump is ~20x larger (the grid points next to Gamma are anisotropic in Cartesian
+    space), so this is where its q-direction dependence is exercised."""
+    atoms = monomer_in_box(box=box)
     fs = make_fourier_settings(coordination="d3")
     bohr = fs.bohr_in_angstrom
     cell = torch.tensor(atoms.cell.array)
@@ -120,11 +145,12 @@ def test_singular_correction_convergence():
     def energy(n, correct):
         return float(long_range_energy(pos, cell, a, mu, nl, g, k_cut, (n, n, n), correct))
 
-    ref = energy(5, True)
+    ref = energy(6, True)
     raw_2, raw_3 = abs(energy(2, False) - ref), abs(energy(3, False) - ref)
-    cor_2, cor_3 = abs(energy(2, True) - ref), abs(energy(3, True) - ref)
+    cor_2, cor_3, cor_4 = (abs(energy(n, True) - ref) for n in (2, 3, 4))
     assert cor_2 < 0.4 * raw_2 and cor_3 < 0.15 * raw_3
-    assert raw_2 / raw_3 == pytest.approx(27 / 8, rel=0.15)  # the uncorrected 1/N_q law
+    assert raw_2 / raw_3 == pytest.approx(27 / 8, rel=0.2)  # the uncorrected 1/N_q law
+    assert cor_3 / cor_4 > (4 / 3) ** 4  # faster than 1/N_q^(4/3) once corrected
 
 
 SPECIES_SETS = sorted({tuple(sorted(set(structures()[n].numbers.tolist()))) for n in names("")})
