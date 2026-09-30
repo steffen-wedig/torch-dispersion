@@ -1,0 +1,147 @@
+{
+  "oracle": "simple-dftd3 Python bindings, dftd3 1.6.0",
+  "damping": {
+    "method": "r2scan",
+    "s6": 1.0,
+    "s8": 0.78981345,
+    "s9": 1.0,
+    "a1": 0.49484001,
+    "a2": 5.73083694,
+    "alpha": 14.0
+  },
+  "units": "atomic: energy Hartree, gradient Hartree/bohr, virial Hartree (extensive, library sign convention); structures.extxyz is in Angstrom, converted to bohr with 1 bohr = 0.52917721 Angstrom exactly as the oracle was fed",
+  "cutoff_sets_bohr": {
+    "default": {
+      "disp2": 60.0,
+      "disp3": 40.0,
+      "cn": 40.0
+    },
+    "disp3_25": {
+      "disp2": 60.0,
+      "disp3": 25.0,
+      "cn": 40.0
+    }
+  },
+  "key_pattern": "<name>/<cutoff set>/{atm_energy, atm_gradient, atm_virial, two_body_energy}",
+  "structures": [
+    {
+      "name": "benzamide_liquid",
+      "atom_count": 256,
+      "periodic": true,
+      "global_structure_index": 3775,
+      "trajectory_name": "benzamide_5000bar_530K"
+    },
+    {
+      "name": "benzamide_crystal",
+      "atom_count": 16,
+      "periodic": true,
+      "global_structure_index": 71837,
+      "trajectory_name": null
+    },
+    {
+      "name": "benzamide_monomer_C7H7NO",
+      "atom_count": 16,
+      "periodic": false
+    },
+    {
+      "name": "bromobenzene_liquid",
+      "atom_count": 252,
+      "periodic": true,
+      "global_structure_index": 1756,
+      "trajectory_name": "bromobenzene_5000bar_400K"
+    },
+    {
+      "name": "bromobenzene_crystal",
+      "atom_count": 12,
+      "periodic": true,
+      "global_structure_index": 72501,
+      "trajectory_name": null
+    },
+    {
+      "name": "bromobenzene_monomer_C6H5Br",
+      "atom_count": 12,
+      "periodic": false
+    },
+    {
+      "name": "cyclohexane_liquid",
+      "atom_count": 252,
+      "periodic": true,
+      "global_structure_index": 4785,
+      "trajectory_name": "cyclohexane_5000bar_345K"
+    },
+    {
+      "name": "cyclohexane_crystal",
+      "atom_count": 18,
+      "periodic": true,
+      "global_structure_index": 73293,
+      "trajectory_name": null
+    },
+    {
+      "name": "cyclohexane_monomer_C6H12",
+      "atom_count": 18,
+      "periodic": false
+    },
+    {
+      "name": "dmso_liquid",
+      "atom_count": 250,
+      "periodic": true,
+      "global_structure_index": 745,
+      "trajectory_name": "dmso_5000bar_400K"
+    },
+    {
+      "name": "dmso_crystal",
+      "atom_count": 10,
+      "periodic": true,
+      "global_structure_index": 74065,
+      "trajectory_name": null
+    },
+    {
+      "name": "dmso_monomer_C2H6OS",
+      "atom_count": 10,
+      "periodic": false
+    },
+    {
+      "name": "emim_ntf2_liquid",
+      "atom_count": 238,
+      "periodic": true,
+      "global_structure_index": 69939,
+      "trajectory_name": "emim_ntf2_1000bar_450K"
+    },
+    {
+      "name": "emim_ntf2_crystal",
+      "atom_count": 34,
+      "periodic": true,
+      "global_structure_index": 74859,
+      "trajectory_name": null
+    },
+    {
+      "name": "emim_ntf2_monomer_C6H11N2",
+      "atom_count": 19,
+      "periodic": false
+    },
+    {
+      "name": "emim_ntf2_monomer_C2F6NO4S2",
+      "atom_count": 15,
+      "periodic": false
+    },
+    {
+      "name": "glycerol_liquid",
+      "atom_count": 252,
+      "periodic": true,
+      "global_structure_index": 2765,
+      "trajectory_name": "glycerol_5000bar_450K"
+    },
+    {
+      "name": "glycerol_crystal",
+      "atom_count": 14,
+      "periodic": true,
+      "global_structure_index": 75602,
+      "trajectory_name": null
+    },
+    {
+      "name": "glycerol_monomer_C3H8O3",
+      "atom_count": 14,
+      "periodic": false
+    }
+  ]
+}
