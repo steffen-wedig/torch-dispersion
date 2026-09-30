@@ -55,6 +55,27 @@ Main options:
 | `kernel_gradient` | analytic | `analytic` or `vjp` (reference) |
 | `dtype`, `device`, `compile` | float64, cuda, True | |
 
+## FourierATM (cutoff-free)
+
+`fourier_atm` evaluates the same D3 ATM term with no three-body cutoff:
+
+- **Undamped part:** a dense triple-dipole trace, −(s9/18) Σ_r μ_r ⟨Tr[(D_r A(q))³]⟩_q. It uses Bloch–Ewald dipole matrices A(q) on a small q-grid and a separable (CP) fit of D3's C9.
+- **Short-range correction:** real-space triangles with all legs within 20 bohr get D3's exact damping and exact C9.
+
+```python
+from torch_atm import FourierATMSettings, fourier_atm, TorchATMCalculator
+
+settings = FourierATMSettings(device="cuda")  # smooth_cut CN (as FourierD3); or coordination="d3"
+result = fourier_atm(numbers, positions, cell, pbc=True, settings=settings)
+atoms.calc = TorchATMCalculator(settings)  # same calculator, dispatches on the settings
+```
+
+On the 250-atom liquids (H200), energy + forces + stress take about 0.05 s. The real-space term takes 0.33 s at 40 bohr.
+
+FourierATM is within 0.001–0.006 meV/atom of the real-space sum at 80 bohr. The 40-bohr sum (which the FHI-aims labels use) is 0.007–0.014 below it.
+
+Use float64. Method, validation and limits: [`docs/fourier_atm.md`](docs/fourier_atm.md).
+
 ## How it works
 
 1. **Graph stage** (autograd): positions and a zero strain → CN → Gaussian reference weights

@@ -203,3 +203,41 @@ def random_cell(n: int, seed: int, cell_lengths=(4.5, 5.0, 5.5), angles=(80, 95,
         d = atoms.get_all_distances(mic=True)
         if n == 1 or d[np.triu_indices(n, 1)].min() > 1.0:
             return atoms
+
+
+def make_fourier_settings(device="cpu", compile=False, **overrides):
+    from torch_atm.settings import FourierATMSettings
+
+    kwargs = {
+        "device": device,
+        "compile": compile,
+        "s9": DAMPING["s9"],
+        "alpha": DAMPING["alpha"],
+        **UNITS,
+    }
+    kwargs.update(overrides)
+    return FourierATMSettings(**kwargs)
+
+
+def run_fourier(atoms: Atoms, settings, **kwargs):
+    from torch_atm.fourier import fourier_atm
+
+    pbc = bool(atoms.pbc.all())
+    return fourier_atm(
+        torch.tensor(atoms.numbers),
+        torch.tensor(atoms.positions),
+        torch.tensor(atoms.cell.array) if pbc else None,
+        pbc,
+        settings,
+        **kwargs,
+    )
+
+
+def monomer_in_box(name="benzamide_monomer_C7H7NO", box=(16.0, 17.0, 18.0)) -> Atoms:
+    """A fixture monomer in an orthorhombic cell (Å): periodic but sparse, so the brute-force
+    triangle sum converges at affordable cutoffs."""
+    atoms = structures()[name].copy()
+    atoms.cell = list(box)
+    atoms.pbc = True
+    atoms.center()
+    return atoms

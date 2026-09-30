@@ -2,13 +2,17 @@
 
 from .ase_calculator import TorchATMCalculator
 from .atm import ATMResult, atm_dispersion
-from .settings import ATMSettings, BruteForceNeighbors, NvalchemiNeighbors
+from .fourier import FourierATMResult, fourier_atm
+from .settings import ATMSettings, BruteForceNeighbors, FourierATMSettings, NvalchemiNeighbors
 
 __all__ = [
     "ATMResult",
     "ATMSettings",
     "BruteForceNeighbors",
+    "FourierATMResult",
+    "FourierATMSettings",
     "NvalchemiNeighbors",
     "TorchATMCalculator",
     "atm_dispersion",
+    "fourier_atm",
 ]
