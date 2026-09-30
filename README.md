@@ -12,7 +12,7 @@ uv sync                      # core: torch, ase, numpy, pydantic
 uv sync --extra nvalchemi    # + the nvalchemiops (warp) neighbour-list backend
 ```
 
-`torch.compile` on **CPU** needs a C++20 compiler (inductor); on DAIS run `module load gcc/14`
+`torch.compile` on **CPU** needs a C++20 compiler (inductor); on DAIS run `module load gcc/15`
 and `export CXX=$(which g++)` first. CUDA compilation uses Triton and needs nothing extra.
 
 ## Usage

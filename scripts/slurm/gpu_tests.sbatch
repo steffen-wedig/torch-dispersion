@@ -14,7 +14,7 @@
 #SBATCH --output=logs/%x_%j.out
 
 set -euo pipefail
-module load gcc/14
+module load gcc/15
 export CXX="$(which g++)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run pytest -m gpu -p no:logging -q -ra --durations=30 "$@"

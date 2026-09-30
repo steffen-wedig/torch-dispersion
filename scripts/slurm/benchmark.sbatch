@@ -14,7 +14,7 @@
 #SBATCH --output=logs/%x_%j.out
 
 set -euo pipefail
-module load gcc/14
+module load gcc/15
 export CXX="$(which g++)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 uv run python scripts/benchmark.py --out "benchmarks/results/h200_${SLURM_JOB_ID}.json" "$@"
