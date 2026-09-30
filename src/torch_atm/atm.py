@@ -21,7 +21,7 @@ from torch import Tensor
 from .c6 import pairwise_c6, reference_weights
 from .coordination import CN_MIN_R2, coordination_number
 from .data import MAX_REFERENCES, ReferenceData, check_numbers, reference_data
-from .kernel import KernelParams, TileInputs, get_tile_fn
+from .kernel import Accumulators, KernelParams, TileInputs, get_step_fn, zero_accumulators
 from .neighbors import NeighborMatrix, make_builder
 from .settings import ATMSettings
 
@@ -117,6 +117,14 @@ def _check_coincident(nl: NeighborMatrix, positions: Tensor, cell: Tensor | None
         raise ValueError("coincident atoms (or periodic images) found")
 
 
+def _mark_system_sized(acc: Accumulators) -> None:
+    """The accumulators' Np dimensions are dynamic like C6's (outputs of a compiled call are new
+    tensors, so this is repeated before every call)."""
+    torch._dynamo.mark_dynamic(acc.grad_pos, 0)
+    torch._dynamo.mark_dynamic(acc.grad_c6, 0)
+    torch._dynamo.mark_dynamic(acc.grad_c6, 1)
+
+
 def _zero_result(n, pbc, compute_forces, compute_stress, device) -> ATMResult:
     f64 = torch.float64
     return ATMResult(
@@ -192,6 +200,7 @@ def atm_dispersion(
         )
 
     # stage 2: blocked triples on detached C6
+    f64 = torch.float64
     c6_leaf = c6.detach()
     pos_d = pad_positions(pos_s.detach(), n_padded)
     vec = nl_atm.vectors(pos_d, None if cell_s is None else cell_s.detach())
@@ -203,54 +212,55 @@ def atm_dispersion(
         cutoff=c3,
         width=settings.three_body_cutoff_width_bohr,
     ).scalars(dtype, device)
-    tile_fn = get_tile_fn(with_grad=need_grad, compile=settings.compile)
+    step = get_step_fn(need_grad, settings.compile, settings.kernel_gradient)
     if settings.compile:
-        # the C6 matrix is the only system-sized kernel input
+        # the C6 matrix (and the accumulators) are the only system-sized kernel inputs
         torch._dynamo.mark_dynamic(c6_leaf, 0)
         torch._dynamo.mark_dynamic(c6_leaf, 1)
 
-    f64 = torch.float64
-    energy = torch.zeros((), dtype=f64, device=device)
-    grad_pos = torch.zeros((n_padded, 3), dtype=f64, device=device)
-    grad_c6 = torch.zeros((n_padded, n_padded), dtype=f64, device=device)
-    virial = torch.zeros((3, 3), dtype=f64, device=device)
+    # tiled layout (blocks, tiles, B, T, ...): every tile is a contiguous view with fixed strides
+    n_blocks, n_tiles_max = n_padded // block, nl_atm.width // tile
+
+    def tiled(x: Tensor) -> Tensor:
+        x = x.reshape(n_blocks, block, n_tiles_max, tile, *x.shape[2:])
+        return x.transpose(1, 2).contiguous()
+
+    idx_t, mask_t, z_t, vec_t = (tiled(x) for x in (nl_atm.indices, nl_atm.mask, z_nb, vec))
+    centres = torch.arange(n_padded, device=device).reshape(n_blocks, block)
+    z_centres = system.numbers.reshape(n_blocks, block)
     diag = {flag: torch.tensor(flag, device=device) for flag in (True, False)}
-    counts = nl_atm.count.cpu()
-    for b0 in range(0, n, block):
-        rows = slice(b0, b0 + block)
-        n_tiles = -(-int(counts[rows].max()) // tile)
-        centre = torch.arange(b0, b0 + block, device=device)
+    counts = nl_atm.count.reshape(n_blocks, block).amax(1).cpu().tolist()
+
+    acc: Tensor | Accumulators
+    acc = (
+        zero_accumulators(n_padded, device)
+        if need_grad
+        else torch.zeros((), dtype=f64, device=device)
+    )
+    for kb in range(-(-n // block)):
+        n_tiles = -(-int(counts[kb]) // tile)
         for p in range(n_tiles):
-            cols_n = slice(p * tile, (p + 1) * tile)
             for q in range(p, n_tiles):
-                cols_m = slice(q * tile, (q + 1) * tile)
                 inputs = TileInputs(
-                    centre=centre,
-                    idx_n=nl_atm.indices[rows, cols_n].contiguous(),
-                    idx_m=nl_atm.indices[rows, cols_m].contiguous(),
-                    mask_n=nl_atm.mask[rows, cols_n].contiguous(),
-                    mask_m=nl_atm.mask[rows, cols_m].contiguous(),
-                    z_centre=system.numbers[rows],
-                    z_n=z_nb[rows, cols_n].contiguous(),
-                    z_m=z_nb[rows, cols_m].contiguous(),
+                    centre=centres[kb],
+                    idx_n=idx_t[kb, p],
+                    idx_m=idx_t[kb, q],
+                    mask_n=mask_t[kb, p],
+                    mask_m=mask_t[kb, q],
+                    z_centre=z_centres[kb],
+                    z_n=z_t[kb, p],
+                    z_m=z_t[kb, q],
                     r0=r0_table,
                     diagonal=diag[p == q],
                 )
-                # contiguous tiles: strides of a view would depend on the list width
-                v_n = vec[rows, cols_n].contiguous()
-                v_m = vec[rows, cols_m].contiguous()
-                if not need_grad:
-                    energy += tile_fn(v_n, v_m, c6_leaf, inputs, scalars)
-                    continue
-                e, g_n, g_m, g_c6 = tile_fn(v_n, v_m, c6_leaf, inputs, scalars)
-                energy += e
-                g_n, g_m = g_n.to(f64), g_m.to(f64)
-                grad_pos.index_add_(0, inputs.idx_n.reshape(-1), g_n.reshape(-1, 3))
-                grad_pos.index_add_(0, inputs.idx_m.reshape(-1), g_m.reshape(-1, 3))
-                grad_pos.index_add_(0, centre, -(g_n.sum(1) + g_m.sum(1)))
-                virial += torch.einsum("btx,bty->xy", v_n.to(f64), g_n)
-                virial += torch.einsum("btx,bty->xy", v_m.to(f64), g_m)
-                grad_c6 += g_c6
+                if settings.compile and isinstance(acc, Accumulators):
+                    _mark_system_sized(acc)
+                acc = step(acc, vec_t[kb, p], vec_t[kb, q], c6_leaf, inputs, scalars)
+
+    if isinstance(acc, Accumulators):
+        energy, grad_pos, virial, grad_c6 = acc
+    else:
+        energy = acc
 
     forces = stress = virial_out = None
     if need_grad:

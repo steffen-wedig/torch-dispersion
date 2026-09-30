@@ -52,6 +52,8 @@ class ATMSettings(BaseModel):
     a ``neighbor_tile_size`` x ``neighbor_tile_size`` tile of neighbour pairs, so this bounds the
     kernel memory independently of the neighbour count. It is also the padding bucket of the
     neighbour axis."""
+    kernel_gradient: Literal["analytic", "vjp"] = "analytic"
+    """Triple-kernel derivatives: hand-written, or ``torch.func.vjp`` (the reference)."""
     neighbor_backend: NeighborBackend = BruteForceNeighbors()
     bohr_in_angstrom: float = Field(default=ase.units.Bohr, gt=0)
     hartree_in_ev: float = Field(default=ase.units.Hartree, gt=0)

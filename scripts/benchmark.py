@@ -29,10 +29,9 @@ BOHR, HARTREE = 0.52917721, 27.211384500  # the fixtures' (FHI-aims) constants
 
 
 def count_triangles(atoms, settings: ATMSettings) -> int:
-    """Number of triangles inside the cutoff (each counted once), via a counting kernel."""
-    total = torch.zeros((), dtype=torch.float64, device=settings.torch_device)
+    """Number of triangles inside the cutoff (each counted once), via a counting step."""
 
-    def counting_tile(v_n, v_m, c6, t: TileInputs, s):
+    def counting_step(acc, v_n, v_m, c6, t: TileInputs, s):
         cutoff2 = s.cutoff * s.cutoff
         eps = torch.finfo(v_n.dtype).eps
         r2_ij, r2_ik = v_n.square().sum(-1), v_m.square().sum(-1)
@@ -43,15 +42,15 @@ def count_triangles(atoms, settings: ATMSettings) -> int:
         upper = order[:, None] < order[None, :]
         valid = ok_ij[:, :, None] & ok_ik[:, None, :] & (r2_jk <= cutoff2) & (r2_jk > eps)
         valid = valid & (upper | ~t.diagonal)
-        total.add_(valid.sum(dtype=torch.float64))
-        return torch.zeros((), dtype=torch.float64, device=v_n.device)
+        return acc + valid.sum(dtype=torch.float64)
 
-    def counting_tile_fn(with_grad: bool, compile: bool):
-        return counting_tile
+    def counting_step_fn(with_grad: bool, compile: bool, gradient: str = "analytic"):
+        return counting_step
 
-    with patch.object(atm_module, "get_tile_fn", counting_tile_fn):
-        run(atoms, settings.model_copy(update={"compile": False}), grad=False)
-    return round(float(total) / 3.0)  # each triangle is seen from its three vertices
+    with patch.object(atm_module, "get_step_fn", counting_step_fn):
+        result = run(atoms, settings.model_copy(update={"compile": False}), grad=False)
+    # the energy slot now holds the count (times hartree_in_ev); each triangle has 3 vertices
+    return round(float(result.energy) / settings.hartree_in_ev)
 
 
 def run(atoms, settings, grad: bool):

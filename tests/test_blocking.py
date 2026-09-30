@@ -42,5 +42,6 @@ def test_pair_block_size(device):
         got = run(
             atoms, make_settings(device, **SHORT).model_copy(update={"neighbor_backend": backend})
         )
-        torch.testing.assert_close(got.energy, ref.energy, rtol=0, atol=0)
-        torch.testing.assert_close(got.forces, ref.forces, rtol=0, atol=0)
+        # not bitwise on GPU: index_add_ accumulates with atomics
+        close(got.energy, ref.energy)
+        close(got.forces, ref.forces)
