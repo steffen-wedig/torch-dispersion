@@ -107,8 +107,8 @@ def main() -> None:
     parser.add_argument("--dtypes", nargs="*", default=["float64", "float32"])
     parser.add_argument("--compile", nargs="*", default=["eager", "compiled"])
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--block", type=int, default=16)
-    parser.add_argument("--tile", type=int, default=256)
+    parser.add_argument("--block", type=int, default=32)
+    parser.add_argument("--tile", type=int, default=512)
     parser.add_argument("--oracle", action="store_true", help="also time the CPU oracle")
     args = parser.parse_args()
 

@@ -45,9 +45,11 @@ class ATMSettings(BaseModel):
     three_body_cutoff_bohr: float = Field(default=40.0, gt=0)
     three_body_cutoff_width_bohr: float = Field(default=0.0, ge=0)
     coordination_cutoff_bohr: float = Field(default=40.0, gt=0)
-    centre_block_size: int = Field(default=16, gt=0)
-    """Centres per kernel call."""
-    neighbor_tile_size: int = Field(default=256, gt=0)
+    centre_block_size: int = Field(default=32, gt=0)
+    """Centres per kernel call. Defaults (32, 512) from the H200 sweep: 0.30 s for energy, forces
+    and stress of a 250-atom liquid at 40 bohr (B = 16: 0.34 s, B = 64: 0.28 s at 1.6x memory);
+    smaller shapes are bound by per-call overhead."""
+    neighbor_tile_size: int = Field(default=512, gt=0)
     """Neighbour tile width of the kernel. One call evaluates ``centre_block_size`` centres times
     a ``neighbor_tile_size`` x ``neighbor_tile_size`` tile of neighbour pairs, so this bounds the
     kernel memory independently of the neighbour count. It is also the padding bucket of the

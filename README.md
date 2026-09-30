@@ -51,7 +51,8 @@ Main options:
 | `three_body_cutoff_width_bohr` | 0 | > 0 multiplies each leg by a quintic switch on (cutoff − width, cutoff); use it for MD with a shortened cutoff |
 | `coordination_cutoff_bohr` | 40 | hard CN cutoff |
 | `neighbor_backend` | brute force | `{"kind": "brute_force"}` or `{"kind": "nvalchemi", "max_neighbors": ...}` |
-| `centre_block_size`, `neighbor_tile_size` | 16, 256 | kernel shape: B centres × T × T neighbour pairs per call |
+| `centre_block_size`, `neighbor_tile_size` | 32, 512 | kernel shape: B centres × T × T neighbour pairs per call |
+| `kernel_gradient` | analytic | `analytic` or `vjp` (reference) |
 | `dtype`, `device`, `compile` | float64, cuda, True | |
 
 ## How it works
@@ -59,20 +60,31 @@ Main options:
 1. **Graph stage** (autograd): positions and a zero strain → CN → Gaussian reference weights
    → C6 matrix (N × N).
 2. **Triple stage** (blocked): C6 is detached; a Python loop over blocks of B centres and pairs
-   of T-wide tiles of their neighbour lists calls a fixed-shape kernel that returns the tile
-   energy and, through `torch.func.vjp`, its gradients with respect to the tile's displacement
-   vectors and to C6. These are scatter-accumulated into dE/dR, the strain virial and dE/dC6, so
-   memory is bounded by one tile, not by the ~10⁹ triangles of a liquid box.
+   of T-wide tiles of their neighbour lists calls a fixed-shape compiled step that evaluates the
+   tile's energy and its gradients with respect to the displacement vectors and to C6, and adds
+   them to running sums of dE/dR, the strain virial and dE/dC6. Memory is bounded by one tile,
+   not by the ~10⁹ triangles of a liquid box. The derivatives are hand-written
+   (`kernel_gradient="analytic"`): per-triangle math in one pointwise graph, row/column sums,
+   batched matmuls and one-hot matmuls (no atomics) in a second. `kernel_gradient="vjp"` uses
+   `torch.func.vjp` instead; it is the reference (they agree to 1e-12) and ~4× slower.
 3. **Chain closure**: `torch.autograd.grad(C6, ..., grad_outputs=dE/dC6)` adds the CN part.
 
 Every unordered neighbour pair {n, m} of every centre i is visited once and the sum is divided
 by 3, which covers triangles through periodic images of the same atom (the one-atom cell case).
 
 **Recompilation control.** The kernel's heavy tensors are (B, T) and (B, T, T), fixed by the
-settings; its only system-sized input (the C6 matrix) has dynamic dimensions and its parameters
-are 0-d tensors. So one kernel graph serves every system, cutoff and neighbour count; only a new
+settings; its only system-sized inputs (the C6 matrix and the running sums) have dynamic
+dimensions and its parameters are 0-d tensors. So one compiled kernel serves every system,
+cutoff and neighbour count; only a new
 `(centre_block_size, neighbor_tile_size)`, dtype or device compiles a new one. Stage 1 (CN, C6)
 is compiled with dynamic shapes. MD steps do not recompile (tested).
+
+## Performance
+
+On one H200, a 250-atom liquid box at the full 40 bohr cutoff takes 0.33 s for energy, forces and
+stress in float64 (0.09 s energy only), against 36 s for the CPU oracle; at 25 bohr it is
+0.04 s. Memory stays below 0.8 GiB. Details: [`docs/benchmark.md`](docs/benchmark.md), produced
+by `sbatch scripts/slurm/benchmark.sbatch --oracle` and `scripts/benchmark_report.py`.
 
 ## Tests
 
