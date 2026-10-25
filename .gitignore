@@ -14,3 +14,6 @@ wheels/
 .ruff_cache/
 logs/
 benchmarks/results/
+
+# Claude Code agent worktrees
+.claude/worktrees/
