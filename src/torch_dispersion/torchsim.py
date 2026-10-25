@@ -37,6 +37,10 @@ class D4Model(ModelInterface):
     The total charge of each system is the state's ``total_charge`` (or ``charge``) per-system
     extra if present, else 0. The batch's ``pbc`` must be all True or all False: TorchSim
     states carry one ``pbc`` for the whole batch, and D4 supports only molecules and 3D cells.
+
+    ``batch_neighbor_list=False`` builds each system's neighbour list just before it is
+    evaluated instead of all in one batched call: the peak memory of a per-system loop, at the
+    cost of one list launch per system (see ``d4_dispersion_batched``).
     """
 
     def __init__(
@@ -46,11 +50,13 @@ class D4Model(ModelInterface):
         compute_forces: bool = True,
         compute_stress: bool = True,
         compute_charges: bool = False,
+        batch_neighbor_list: bool = True,
         dtype: torch.dtype = torch.float64,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.compute_charges = compute_charges
+        self.batch_neighbor_list = batch_neighbor_list
         self._device = settings.torch_device
         self._dtype = dtype
         self._compute_forces = compute_forces
@@ -85,6 +91,7 @@ class D4Model(ModelInterface):
             charges=charge,
             compute_forces=self._compute_forces,
             compute_stress=self._compute_stress,
+            batch_neighbor_list=self.batch_neighbor_list,
         )
         out = {"energy": result.energy}
         if result.forces is not None:

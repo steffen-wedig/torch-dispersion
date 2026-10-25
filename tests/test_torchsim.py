@@ -1,8 +1,9 @@
 """The batched TorchSim model ``torch_dispersion.torchsim.D4Model``.
 
 Every system of a batch must equal ``d4_dispersion`` on that system alone (energy, forces,
-stress, charges): exactly with the brute-force backend (same per-system lists, same code path),
-to rounding with nvalchemiops (the batched list orders neighbours differently). Shortened
+stress, charges): exactly with the brute-force backend on the CPU (same per-system lists, same
+code path), to rounding with nvalchemiops (the batched list orders neighbours differently) and
+on CUDA (atomic scatter-adds are not deterministic, not even between two calls). Shortened
 cutoffs keep the CPU cases fast; the ~1000-atom mixed batches with ATM or brute force are slow.
 """
 
@@ -86,10 +87,15 @@ def assert_matches_loop(out, atoms_list, settings, compute_charges: bool, exact:
     assert set(out) == set(expected)
     for key, value in expected.items():
         assert out[key].dtype == torch.float64
-        if exact:
-            assert torch.equal(out[key], value), (key, (out[key] - value).abs().max())
-        else:
-            torch.testing.assert_close(out[key], value, rtol=1e-12, atol=1e-13)
+        assert_same(out[key], value, exact)
+
+
+def assert_same(got, expected, exact: bool):
+    """Bit for bit if ``exact`` on the CPU, else to rounding."""
+    if exact and got.device.type == "cpu":
+        assert torch.equal(got, expected), (got - expected).abs().max()
+    else:
+        torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-13)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -121,6 +127,18 @@ def test_batch_equals_loop(batch, backend, s9, device):
 
 
 @pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("backend", ["brute_force", "nvalchemi"])
+@pytest.mark.parametrize("batch", ["equal", "molecules"])
+def test_per_system_neighbor_lists(batch, backend, device):
+    """``batch_neighbor_list=False`` (lists built system by system) equals the loop too."""
+    atoms_list = BATCHES[batch]()
+    settings = make_d4_settings(device, backend=backend, **SHORT)
+    model = D4Model(settings, compute_charges=True, batch_neighbor_list=False)
+    out = model(to_state(atoms_list, device))
+    assert_matches_loop(out, atoms_list, settings, True, exact=True)
+
+
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("compute_charges", [False, True])
 def test_charges_output(compute_charges, device):
     """Charges only on request; the ions keep their total charge."""
@@ -144,7 +162,7 @@ def test_energy_only_and_attributes(device):
     out = model(to_state(atoms_list, device))
     assert set(out) == {"energy"}
     expected = torch.stack([run_d4(a, settings).energy for a in atoms_list])
-    assert torch.equal(out["energy"], expected)
+    assert_same(out["energy"], expected, exact=True)
     model.compute_forces = model.compute_stress = True
     assert set(model(to_state(atoms_list, device))) == {"energy", "forces", "stress"}
 
@@ -160,7 +178,7 @@ def test_positions_requiring_grad(device):
     out = model(state)
     for key, value in ref.items():
         assert not out[key].requires_grad
-        assert torch.equal(out[key], value)
+        assert_same(out[key], value, exact=True)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -185,7 +203,7 @@ def test_sum_model_optimize(device):
     state = to_state(atoms_list, device)
     out, out_soft, out_d4 = model(state), soft(state), d4(state)
     for key in ("energy", "forces", "stress"):
-        torch.testing.assert_close(out[key], out_soft[key] + out_d4[key], rtol=1e-14, atol=0)
+        torch.testing.assert_close(out[key], out_soft[key] + out_d4[key], rtol=1e-14, atol=1e-15)
 
     final = ts.optimize(
         system=state,

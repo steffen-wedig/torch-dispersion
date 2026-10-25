@@ -5,7 +5,9 @@ per system and one periodicity for the whole batch. What is batched and what is 
 
 - the neighbour list: one batched build at ``neighbor_list_cutoff`` (nvalchemiops'
   ``system_idx``-aware list; the brute-force backend builds per system), split into one
-  matrix per system with system-local indices;
+  matrix per system with system-local indices. It holds the lists of the whole batch at once
+  (at 60 bohr ~0.3 GiB per 1000 atoms), so ``batch_neighbor_list=False`` builds each system's
+  list just before its evaluation instead;
 - input checks and unit conversion: once for the batch;
 - everything else runs per system through ``evaluate_system``, the same code path as
   ``d4_dispersion``: CN, the EEQ solve with the system's own total charge, the (Np x Np) C6
@@ -25,10 +27,16 @@ import torch
 from torch import Tensor
 
 from ..atm import check_pbc
-from ..neighbors import build_batched
+from ..neighbors import NeighborMatrix, build_batched, make_builder
 from ..settings import D4Settings
 from .data import d4_reference_data
-from .dispersion import check_numbers, evaluate_system, neighbor_list_cutoff, to_bohr
+from .dispersion import (
+    D4Result,
+    check_numbers,
+    evaluate_system,
+    neighbor_list_cutoff,
+    to_bohr,
+)
 
 
 @dataclass
@@ -50,6 +58,7 @@ def d4_dispersion_batched(
     charges: Sequence[float] | Tensor | None = None,
     compute_forces: bool = True,
     compute_stress: bool = True,
+    batch_neighbor_list: bool = True,
 ) -> D4BatchResult:
     """DFT-D4 of S systems concatenated along the atom axis: ``numbers`` (N,), ``positions``
     (N, 3) in Å, ``cells`` (S, 3, 3) in Å with rows = lattice vectors (ignored without PBC),
@@ -58,6 +67,10 @@ def d4_dispersion_batched(
     ``pbc`` is one setting for the whole batch, all True or all False (a batch cannot mix
     molecules and cells). Returns float64 tensors on ``settings.device``; every system's entries
     equal ``d4_dispersion`` on that system alone.
+
+    ``batch_neighbor_list``: build all lists up front in one batched call (fewer launches, but
+    the lists of the whole batch are held at once), or each system's list just before its
+    evaluation (the memory of a ``d4_dispersion`` loop).
     """
     pbc = check_pbc(pbc)
     device = settings.torch_device
@@ -81,26 +94,34 @@ def d4_dispersion_batched(
     if pbc and cells is not None:
         cells_b = to_bohr(cells, settings).reshape(n_systems, 3, 3)
         cells_a = torch.as_tensor(cells).reshape(n_systems, 3, 3)
-    neighbors = build_batched(
-        settings.neighbor_backend, pos, cells_b, pbc, neighbor_list_cutoff(settings), counts
-    )
+    cutoff = neighbor_list_cutoff(settings)
+    starts = [sum(counts[:s]) for s in range(n_systems)]
+    pending: list[NeighborMatrix | None] = [None] * n_systems
+    if batch_neighbor_list:
+        pending = list(build_batched(settings.neighbor_backend, pos, cells_b, pbc, cutoff, counts))
+    single = make_builder(settings.neighbor_backend)
 
-    results, start = [], 0
-    for s, n in enumerate(counts):
+    results: list[D4Result] = []
+    for s in range(n_systems):
+        start, n = starts[s], counts[s]
+        nl, pending[s] = pending[s], None  # released once the system is done
+        if nl is None:
+            cell = None if cells_b is None else cells_b[s]
+            nl = single(pos[start : start + n], cell, pbc, cutoff)
         results.append(
             evaluate_system(
                 numbers[start : start + n],
                 pos[start : start + n],
                 None if cells_b is None else cells_b[s],
                 None if cells_a is None else cells_a[s],
-                neighbors[s],
+                nl,
                 settings,
                 total[s],
                 compute_forces,
                 compute_stress,
             )
         )
-        start += n
+        del nl
 
     def stacked(name: str, stack) -> Tensor | None:
         values = [getattr(r, name) for r in results]
