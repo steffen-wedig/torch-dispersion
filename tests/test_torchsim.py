@@ -87,15 +87,17 @@ def assert_matches_loop(out, atoms_list, settings, compute_charges: bool, exact:
     assert set(out) == set(expected)
     for key, value in expected.items():
         assert out[key].dtype == torch.float64
-        assert_same(out[key], value, exact)
+        # the EEQ solve amplifies the rounding of a different neighbour order (batched vs
+        # single nvalchemiops lists on CUDA) to ~3e-13 e in the charges
+        assert_same(out[key], value, exact, atol=1e-12 if key == "charges" else 1e-13)
 
 
-def assert_same(got, expected, exact: bool):
+def assert_same(got, expected, exact: bool, atol: float = 1e-13):
     """Bit for bit if ``exact`` on the CPU, else to rounding."""
     if exact and got.device.type == "cpu":
         assert torch.equal(got, expected), (got - expected).abs().max()
     else:
-        torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-13)
+        torch.testing.assert_close(got, expected, rtol=1e-12, atol=atol)
 
 
 @pytest.mark.parametrize("device", DEVICES)
