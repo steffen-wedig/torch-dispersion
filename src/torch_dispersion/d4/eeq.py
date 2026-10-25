@@ -200,11 +200,10 @@ def _direct_sum(vec: Tensor, block: Tensor, gam: Tensor, alpha: Tensor) -> Tenso
     return torch.where(keep, term, 0.0).sum(-1)
 
 
-def _direct_sum_grad(
-    vec: Tensor, block: Tensor, gam: Tensor, alpha: Tensor, g: Tensor
-) -> tuple[Tensor, Tensor]:
-    """Derivatives of sum_e g_e ``_direct_sum``_e with respect to vec (P, 3) and block (T, 3):
-    d f / d r = 2 / sqrt(pi) (gam exp(-gam^2 r^2) - alpha exp(-alpha^2 r^2)) / r - f / r."""
+def _direct_sum_coef(vec: Tensor, block: Tensor, gam: Tensor, alpha: Tensor, g: Tensor) -> Tensor:
+    """(P, T) coefficients c with d(g_e ``_direct_sum``_e) / d(vec + T) = c_eT (vec + T)_e:
+    c = g f'(r) / r, f'(r) = 2 / sqrt(pi) (gam exp(-gam^2 r^2) - alpha exp(-alpha^2 r^2)) / r
+    - f / r. The only place the backward evaluates the special functions."""
     d = vec[:, None, :] + block
     r2 = d.square().sum(-1)
     keep = r2 >= _WS_THRESHOLD * _WS_THRESHOLD
@@ -214,8 +213,22 @@ def _direct_sum_grad(
     f = (torch.erf(gr * r) - torch.erf(alpha * r)) / r
     gauss = gr * torch.exp(-gr * gr * r2) - alpha * torch.exp(-alpha * alpha * r2)
     dfdr = (_TWO_OVER_SQRTPI * gauss - f) / r
-    dd = torch.where(keep, g[:, None] * dfdr / r, 0.0)[..., None] * d  # (P, T, 3)
-    return dd.sum(1), dd.sum(0)
+    return torch.where(keep, g[:, None] * dfdr / r, 0.0)
+
+
+def _direct_sum_grad(
+    vec: Tensor, block: Tensor, ints: Tensor, gam: Tensor, alpha: Tensor, g: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Derivatives of sum_e g_e ``_direct_sum``_e with respect to vec (P, 3) and to the cell
+    through the translations block = ints @ cell (3, 3), from the coefficients by matmuls:
+
+        d/d vec_e = (sum_T c_eT) vec_e + sum_T c_eT block_T,
+        d/d cell  = sum_eT c_eT ints_T (x) (vec_e + block_T)
+                  = (c @ ints)^T vec + ints^T ((sum_e c_eT) block_T)."""
+    c = _direct_sum_coef(vec, block, gam, alpha, g)
+    dvec = c.sum(1)[:, None] * vec + c @ block
+    dcell = (c @ ints).T @ vec + ints.T @ (c.sum(0)[:, None] * block)
+    return dvec, dcell
 
 
 @cache
@@ -278,18 +291,18 @@ class _DirectCoulomb(torch.autograd.Function):
         off = pairs.i != pairs.j
         g = pairs.weight * torch.where(off, g + grad_a[pairs.j, pairs.i], g)
         fn = _maybe_compiled(_direct_sum_grad, ctx.compile)
-        grad_vec, grad_block = [], torch.zeros_like(block)
+        ints = _direct_block(block.device, block.dtype)
+        grad_vec, grad_cell = [], torch.zeros((3, 3), dtype=block.dtype, device=block.device)
         for s in range(0, vec.shape[0], _PAIR_CHUNK):
             sl = slice(s, s + _PAIR_CHUNK)
-            dv, db = fn(vec[sl], block, gam[sl], alpha, g[sl])
+            dv, dc = fn(vec[sl], block, ints, gam[sl], alpha, g[sl])
             grad_vec.append(dv)
-            grad_block = grad_block + db
+            grad_cell = grad_cell + dc
         dvec = torch.cat(grad_vec)
-        # vec = x_j - x_i + shift @ cell, block = ints @ cell
+        # vec = x_j - x_i + shift @ cell (the block part is already in grad_cell)
         grad_pos = torch.zeros((ctx.n, 3), dtype=dvec.dtype, device=dvec.device)
         grad_pos = grad_pos.index_add(0, pairs.j, dvec).index_add(0, pairs.i, -dvec)
-        ints = _direct_block(block.device, block.dtype)
-        grad_cell = pairs.shift.T @ dvec + ints.T @ grad_block
+        grad_cell = grad_cell + pairs.shift.T @ dvec
         return grad_pos, grad_cell, None, None, None, None
 
 

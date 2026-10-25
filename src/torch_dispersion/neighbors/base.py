@@ -36,7 +36,11 @@ class NeighborMatrix:
         (an unpadded matrix); it then gathers an appended zero row.
         """
         extended = torch.cat([positions, positions.new_zeros(1, 3)])
-        vec = extended[self.indices] - positions[:, None, :]
+        # index_select, not extended[indices]: each atom appears in ~M rows, and the backward of
+        # advanced indexing (a deterministic index_put) serialises on repeated indices on CUDA,
+        # while index_select's backward is an atomic index_add
+        gathered = extended.index_select(0, self.indices.reshape(-1)).view(*self.indices.shape, 3)
+        vec = gathered - positions[:, None, :]
         if cell is not None:
             vec = vec + self.shifts.to(positions.dtype) @ cell
         return torch.where(self.mask[..., None], vec, 0.0)
