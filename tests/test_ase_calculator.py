@@ -7,7 +7,7 @@ from ase.calculators.mixing import SumCalculator
 from ase.stress import full_3x3_to_voigt_6_stress
 from conftest import DEVICES, make_settings, run, structures
 
-from torch_atm.ase_calculator import TorchATMCalculator
+from torch_dispersion.ase_calculator import TorchATMCalculator
 
 SHORT = {"three_body_cutoff_bohr": 20.0, "coordination_cutoff_bohr": 20.0}
 
@@ -85,7 +85,7 @@ D4_SHORT = {"two_body_cutoff_bohr": 25.0, "three_body_cutoff_bohr": 16.0}
 def test_d4_calculator_matches_functional_api(name, device):
     from conftest import make_d4_settings, run_d4
 
-    from torch_atm.ase_calculator import TorchD4Calculator
+    from torch_dispersion.ase_calculator import TorchD4Calculator
 
     settings = make_d4_settings(device, **D4_SHORT)
     charge = 1.0 if "C6H11N2" in name else 0.0

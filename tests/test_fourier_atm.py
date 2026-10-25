@@ -17,7 +17,7 @@ from conftest import (
 )
 from fourier_reference import reference_energy
 
-from torch_atm import TorchATMCalculator
+from torch_dispersion import TorchATMCalculator
 
 H_POS = 1e-4
 H_STRAIN = 1e-5

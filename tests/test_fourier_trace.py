@@ -9,17 +9,17 @@ import pytest
 import torch
 from conftest import make_fourier_settings, monomer_in_box, names, structures
 
-from torch_atm.fourier import separable_c9
-from torch_atm.fourier.cp import fit_c9
-from torch_atm.fourier.dipole import (
+from torch_dispersion.fourier import separable_c9
+from torch_dispersion.fourier.cp import fit_c9
+from torch_dispersion.fourier.dipole import (
     EwaldSetup,
     grid_for_cell,
     molecular_dipole_matrix,
     q_grid,
     trace_energy,
 )
-from torch_atm.fourier.model import ewald_parameters, long_range_energy
-from torch_atm.neighbors import brute_force_neighbors
+from torch_dispersion.fourier.model import ewald_parameters, long_range_energy
+from torch_dispersion.neighbors import brute_force_neighbors
 
 F64 = torch.float64
 
@@ -166,10 +166,10 @@ def test_cp_fit(numbers):
 @pytest.mark.parametrize("name", ["glycerol_crystal", "emim_ntf2_crystal"])
 def test_separable_c9_matches_d3(name):
     """sum_r mu a a a against D3's sqrt(C6 C6 C6) for random atom triples."""
-    from torch_atm.atm import pad_positions, pad_system
-    from torch_atm.c6 import pairwise_c6, reference_weights
-    from torch_atm.coordination import coordination_number
-    from torch_atm.data import reference_data
+    from torch_dispersion.atm import pad_positions, pad_system
+    from torch_dispersion.c6 import pairwise_c6, reference_weights
+    from torch_dispersion.coordination import coordination_number
+    from torch_dispersion.data import reference_data
 
     atoms = structures()[name]
     fs = make_fourier_settings(coordination="d3")

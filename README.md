@@ -1,25 +1,42 @@
-# torch-atm
+# torch-dispersion
 
-A GPU-capable, `torch.compile`-able PyTorch implementation of the D3
-**Axilrod–Teller–Muto (ATM) three-body dispersion term**. It reproduces simple-dftd3 1.6.0
-(energy, forces, stress) for molecules and fully periodic cells, including the CN-dependent C6
-coefficients the term is built on. The specification is [`docs/design.md`](docs/design.md).
+GPU-capable, `torch.compile`-able PyTorch implementations of dispersion corrections, with energy,
+forces and stress for molecules and fully periodic cells. Every term reproduces a reference code.
+
+| term | entry point | settings | reference |
+|---|---|---|---|
+| D3 ATM three-body term, real space | `atm_dispersion` | `ATMSettings` | simple-dftd3 1.6.0 |
+| D3 ATM, cutoff-free (FourierATM) | `fourier_atm` | `FourierATMSettings` | real-space sum at 80 bohr |
+| DFT-D4, two-body + ATM, EEQ charges | `d4_dispersion` | `D4Settings` | dftd4 4.3.0 |
+
+All of them take Å and return eV, eV/Å and eV/Å³ (ASE conventions). ASE calculators are
+`TorchATMCalculator` (both ATM variants) and `TorchD4Calculator`. The real-space ATM was the
+first term; its specification is [`docs/design.md`](docs/design.md).
 
 ## Installation
 
 ```bash
-uv sync                      # core: torch, ase, numpy, pydantic
-uv sync --extra nvalchemi    # + the nvalchemiops (warp) neighbour-list backend
+uv sync    # torch, ase, numpy, pydantic, nvalchemiops (warp neighbour lists)
 ```
 
 `torch.compile` on **CPU** needs a C++20 compiler (inductor); on DAIS run `module load gcc/15`
 and `export CXX=$(which g++)` first. CUDA compilation uses Triton and needs nothing extra.
 
-## Usage
+## Quick start
+
+[`examples/quickstart.py`](examples/quickstart.py) computes D4 and the D3 ATM term for a molecule
+and a periodic crystal, uses the ASE calculators, and runs a few MD steps:
+
+```bash
+uv run python examples/quickstart.py            # CPU
+uv run python examples/quickstart.py --device cuda
+```
+
+## D3 ATM (real space)
 
 ```python
 import torch
-from torch_atm import ATMSettings, atm_dispersion
+from torch_dispersion import ATMSettings, atm_dispersion
 
 settings = ATMSettings(device="cuda")  # s9 = 1, alpha = 14, cutoffs 40 bohr
 result = atm_dispersion(numbers, positions, cell, pbc=True, settings=settings)
@@ -30,7 +47,7 @@ With ASE, e.g. summed with an MLIP and a two-body D3:
 
 ```python
 from ase.calculators.mixing import SumCalculator
-from torch_atm import TorchATMCalculator
+from torch_dispersion import TorchATMCalculator
 
 atoms.calc = SumCalculator([mlip, two_body_d3, TorchATMCalculator(settings)])
 ```
@@ -63,7 +80,7 @@ Main options:
 - **Short-range correction:** real-space triangles with all legs within 20 bohr get D3's exact damping and exact C9.
 
 ```python
-from torch_atm import FourierATMSettings, fourier_atm, TorchATMCalculator
+from torch_dispersion import FourierATMSettings, fourier_atm, TorchATMCalculator
 
 settings = FourierATMSettings(device="cuda")  # smooth_cut CN (as FourierD3); or coordination="d3"
 result = fourier_atm(numbers, positions, cell, pbc=True, settings=settings)
@@ -83,7 +100,7 @@ charges, charge-scaled C6, the two-body rational damping and the ATM term. Energ
 stress are supported for molecules and 3D cells.
 
 ```python
-from torch_atm import D4Settings, TorchD4Calculator, d4_dispersion
+from torch_dispersion import D4Settings, TorchD4Calculator, d4_dispersion
 
 settings = D4Settings(s8=0.60187490, a1=0.51559235, a2=5.77342911)  # r2SCAN-D4 (bj-eeq-atm)
 result = d4_dispersion(numbers, positions, cell, pbc=True, settings=settings, charge=0.0)
@@ -97,7 +114,7 @@ molecular gradients to ~1e-18 Hartree/bohr.
 The oracle is `dftd4==4.3.0`. dftd4 up to 4.1.0 had a wrong periodic ATM gradient, fixed in
 4.1.1; see [`docs/d4.md`](docs/d4.md).
 
-## How it works
+## How it works (real-space ATM)
 
 1. **Graph stage** (autograd): positions and a zero strain → CN → Gaussian reference weights
    → C6 matrix (N × N).
@@ -121,7 +138,7 @@ cutoff and neighbour count; only a new
 `(centre_block_size, neighbor_tile_size)`, dtype or device compiles a new one. Stage 1 (CN, C6)
 is compiled with dynamic shapes. MD steps do not recompile (tested).
 
-## Performance
+## Performance (real-space ATM)
 
 On one H200, a 250-atom liquid box at the full 40 bohr cutoff takes 0.33 s for energy, forces and
 stress in float64 (0.09 s energy only), against 36 s for the CPU oracle; at 25 bohr it is

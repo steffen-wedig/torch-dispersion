@@ -94,7 +94,7 @@ SMOOTH_CN_CUTOFF_BOHR = 6.0 / ase.units.Bohr
 
 class FourierATMSettings(_KernelSettings):
     """Cutoff-free ATM: dense triple-dipole trace (undamped, separable C9) plus a real-space
-    short-range correction to exact D3 (see ``torch_atm.fourier``)."""
+    short-range correction to exact D3 (see ``torch_dispersion.fourier``)."""
 
     coordination: Literal["smooth_cut", "d3"] = "smooth_cut"
     """``smooth_cut``: FourierD3's CN (shared with its two-body term); ``d3``: the exact D3 CN

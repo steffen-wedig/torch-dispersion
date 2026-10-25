@@ -10,8 +10,8 @@ import torch
 from ase.io import read
 from torch.profiler import ProfilerActivity, profile
 
-from torch_atm.atm import atm_dispersion
-from torch_atm.settings import ATMSettings
+from torch_dispersion.atm import atm_dispersion
+from torch_dispersion.settings import ATMSettings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 

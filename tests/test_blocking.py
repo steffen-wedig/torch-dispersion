@@ -4,7 +4,7 @@ import pytest
 import torch
 from conftest import BACKENDS, DEVICES, make_settings, run, structures
 
-from torch_atm.settings import BruteForceNeighbors
+from torch_dispersion.settings import BruteForceNeighbors
 
 SHORT = {"three_body_cutoff_bohr": 20.0, "coordination_cutoff_bohr": 20.0}
 

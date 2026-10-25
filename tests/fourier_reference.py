@@ -1,4 +1,4 @@
-"""Brute-force reference for FourierATM: the real-space triangle sum (torch-atm's tiles) of
+"""Brute-force reference for FourierATM: the real-space triangle sum (torch-dispersion's tiles) of
 
     e = k_D3 fdmp ang S + k_CP ang (1 - S),    S = s(r_ij) s(r_ik) s(r_jk) at r_s,
 
@@ -7,10 +7,10 @@ to the FourierATM energy with the same separable C9."""
 
 import torch
 
-import torch_atm.kernel as kernel_module
-from torch_atm.atm import atm_dispersion
-from torch_atm.fourier import separable_c9
-from torch_atm.settings import ATMSettings, FourierATMSettings
+import torch_dispersion.kernel as kernel_module
+from torch_dispersion.atm import atm_dispersion
+from torch_dispersion.fourier import separable_c9
+from torch_dispersion.settings import ATMSettings, FourierATMSettings
 
 
 def reference_energy(

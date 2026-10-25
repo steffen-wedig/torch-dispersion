@@ -1,6 +1,6 @@
 # FourierATM
 
-A cutoff-free version of the D3 ATM three-body term (`torch_atm.fourier`). It is built on the same CN-based D3 coefficients as the real-space term and involves no learned polarisabilities. It is meant to sit next to FourierD3 (two-body) and can share FourierD3's `smooth_cut` coordination number.
+A cutoff-free version of the D3 ATM three-body term (`torch_dispersion.fourier`). It is built on the same CN-based D3 coefficients as the real-space term and involves no learned polarisabilities. It is meant to sit next to FourierD3 (two-body) and can share FourierD3's `smooth_cut` coordination number.
 
 Status (2026-09-30): implemented and tested.
 

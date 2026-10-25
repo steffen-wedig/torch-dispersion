@@ -9,11 +9,11 @@ import torch
 from conftest import BOHR, ION_CHARGES, d4_properties, names, random_cell, random_cluster
 from conftest import structures as fixture_structures
 
-from torch_atm.c6 import pairwise_c6
-from torch_atm.d4 import eeq
-from torch_atm.d4.data import _raw, d4_reference_data, reference_c6
-from torch_atm.d4.model import d4_coordination_number, polarizabilities, reference_weights
-from torch_atm.neighbors import brute_force_neighbors
+from torch_dispersion.c6 import pairwise_c6
+from torch_dispersion.d4 import eeq
+from torch_dispersion.d4.data import _raw, d4_reference_data, reference_c6
+from torch_dispersion.d4.model import d4_coordination_number, polarizabilities, reference_weights
+from torch_dispersion.neighbors import brute_force_neighbors
 
 # update together with scripts/export_d4_reference_data.py
 CHECKSUM = "9cd98e3d7f1748dc5258eba5f4abd206"

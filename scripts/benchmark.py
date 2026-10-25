@@ -1,4 +1,4 @@
-"""Benchmark torch-atm on the fixture liquid boxes (design §8, "Performance").
+"""Benchmark torch-dispersion on the fixture liquid boxes (design §8, "Performance").
 
 Wall time and peak GPU memory per box for cutoff3 in {25, 30, 40} bohr, float64/float32,
 eager/compiled, energy-only vs energy + forces + stress; triangles per second; and the CPU oracle
@@ -19,10 +19,10 @@ import numpy as np
 import torch
 from ase.io import read
 
-import torch_atm.atm as atm_module
-from torch_atm.atm import atm_dispersion
-from torch_atm.kernel import TileInputs
-from torch_atm.settings import ATMSettings
+import torch_dispersion.atm as atm_module
+from torch_dispersion.atm import atm_dispersion
+from torch_dispersion.kernel import TileInputs
+from torch_dispersion.settings import ATMSettings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 BOHR, HARTREE = 0.52917721, 27.211384500  # the fixtures' (FHI-aims) constants

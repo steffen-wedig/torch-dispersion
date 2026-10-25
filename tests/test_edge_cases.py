@@ -6,10 +6,10 @@ import torch
 from ase import Atoms
 from conftest import DEVICES, make_settings, oracle, run, structures, to_atomic_units
 
-from torch_atm.atm import atm_dispersion
-from torch_atm.c6 import reference_weights
-from torch_atm.data import reference_data
-from torch_atm.settings import ATMSettings
+from torch_dispersion.atm import atm_dispersion
+from torch_dispersion.c6 import reference_weights
+from torch_dispersion.data import reference_data
+from torch_dispersion.settings import ATMSettings
 
 
 @pytest.mark.parametrize("device", DEVICES)

@@ -1,7 +1,7 @@
 #!/bin/bash -l
 # GPU test suite (pytest -m gpu, including slow GPU tests) on one H200/B200.
 # Submit from the repository root: sbatch scripts/slurm/gpu_tests.sbatch [extra pytest args]
-#SBATCH --job-name=torch_atm_gpu_tests
+#SBATCH --job-name=torch_dispersion_gpu_tests
 #SBATCH --account=mpo_inst
 #SBATCH --partition=gpu1
 #SBATCH --nodes=1

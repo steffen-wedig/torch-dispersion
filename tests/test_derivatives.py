@@ -6,7 +6,7 @@ import pytest
 import torch
 from conftest import BACKENDS, DEVICES, make_settings, random_cell, random_cluster, run
 
-import torch_atm.atm as atm_module
+import torch_dispersion.atm as atm_module
 
 H_POS = 1e-4  # Å
 H_STRAIN = 1e-5

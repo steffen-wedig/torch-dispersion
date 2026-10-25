@@ -1,4 +1,4 @@
-"""Export the D4 reference tables into ``src/torch_atm/d4/reference_data.npz``.
+"""Export the D4 reference tables into ``src/torch_dispersion/d4/reference_data.npz``.
 
 Sources (Apache-2.0): tad-dftd4 (reference CNs, charges, polarisabilities, Gaussian-weight
 counts, effective charges, chemical hardnesses, r4/r2 values), tad-multicharge (EEQ-2019
@@ -36,7 +36,7 @@ from tad_dftd4.data import r4r2 as tad_r4r2
 from tad_dftd4.reference import d4 as d4ref
 from tad_dftd4.reference.d4 import charge_eeq
 
-ROOT = Path(__file__).resolve().parents[1] / "src" / "torch_atm"
+ROOT = Path(__file__).resolve().parents[1] / "src" / "torch_dispersion"
 OUT = ROOT / "d4" / "reference_data.npz"
 N_Z = 104  # Z = 0..103
 GA, GC = 3.0, 2.0

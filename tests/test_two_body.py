@@ -16,7 +16,7 @@ from conftest import (
     structures,
 )
 
-from torch_atm.two_body import two_body_energy
+from torch_dispersion.two_body import two_body_energy
 
 
 def two_body(atoms, settings) -> float:

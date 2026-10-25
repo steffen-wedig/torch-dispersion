@@ -9,8 +9,8 @@ import torch
 from ase import Atoms
 from ase.io import read
 
-from torch_atm.atm import ATMResult, atm_dispersion
-from torch_atm.settings import ATMSettings, BruteForceNeighbors, NvalchemiNeighbors
+from torch_dispersion.atm import ATMResult, atm_dispersion
+from torch_dispersion.settings import ATMSettings, BruteForceNeighbors, NvalchemiNeighbors
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MANIFEST = json.loads((FIXTURES / "manifest.json").read_text())
@@ -27,12 +27,6 @@ TOL_GRADIENT = 1e-9
 TOL_VIRIAL = 1e-9
 
 HAS_CUDA = torch.cuda.is_available()
-try:
-    import nvalchemiops  # noqa: F401
-
-    HAS_NVALCHEMI = True
-except ImportError:
-    HAS_NVALCHEMI = False
 
 DEVICES = ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)]
 BACKENDS = ["brute_force", "nvalchemi"]
@@ -65,8 +59,6 @@ def stored_reference(name: str, cutoff_set: str) -> dict[str, np.ndarray]:
 def backend_settings(backend: str):
     if backend == "brute_force":
         return BruteForceNeighbors()
-    if not HAS_NVALCHEMI:
-        pytest.skip("nvalchemiops not installed")
     return NvalchemiNeighbors()
 
 
@@ -207,7 +199,7 @@ def random_cell(n: int, seed: int, cell_lengths=(4.5, 5.0, 5.5), angles=(80, 95,
 
 
 def make_fourier_settings(device="cpu", compile=False, **overrides):
-    from torch_atm.settings import FourierATMSettings
+    from torch_dispersion.settings import FourierATMSettings
 
     kwargs = {
         "device": device,
@@ -221,7 +213,7 @@ def make_fourier_settings(device="cpu", compile=False, **overrides):
 
 
 def run_fourier(atoms: Atoms, settings, **kwargs):
-    from torch_atm.fourier import fourier_atm
+    from torch_dispersion.fourier import fourier_atm
 
     pbc = bool(atoms.pbc.all())
     return fourier_atm(
@@ -274,7 +266,7 @@ ION_CHARGES = {"emim_ntf2_monomer_C6H11N2": 1.0, "emim_ntf2_monomer_C2F6NO4S2": 
 
 
 def make_d4_settings(device="cpu", backend="brute_force", compile=False, **overrides):
-    from torch_atm.settings import D4Settings
+    from torch_dispersion.settings import D4Settings
 
     kwargs = {
         "device": device,
@@ -297,7 +289,7 @@ def d4_cutoff_settings(disp2: float, disp3: float, cn: float) -> dict[str, float
 
 
 def run_d4(atoms: Atoms, settings, charge: float = 0.0, **kwargs):
-    from torch_atm.d4 import d4_dispersion
+    from torch_dispersion.d4 import d4_dispersion
 
     pbc = bool(atoms.pbc.all())
     return d4_dispersion(

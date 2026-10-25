@@ -5,7 +5,7 @@
 
 1. graph stage: positions and strain -> CN -> reference weights -> C6 (Np, Np) and the CP
    factors a (Np, R), with autograd;
-2. short-range triple stage on detached C6 and a (``torch_atm.atm.run_tiles``), accumulating
+2. short-range triple stage on detached C6 and a (``torch_dispersion.atm.run_tiles``), accumulating
    dE/dR, the virial, dE/dC6 and dE/da;
 3. the dense trace with autograd through a, the positions and the cell, and one
    ``torch.autograd.grad`` that closes both chains.

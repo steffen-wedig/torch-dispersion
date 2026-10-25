@@ -1,5 +1,5 @@
-"""D3 Axilrod-Teller-Muto three-body dispersion (simple-dftd3 1.6.0 definition) and DFT-D4
-(dftd4 4.3.0) in PyTorch."""
+"""Dispersion corrections in PyTorch: DFT-D4 (dftd4 4.3.0) and the D3 Axilrod-Teller-Muto
+three-body term (simple-dftd3 1.6.0), in real space and cutoff-free (FourierATM)."""
 
 from .ase_calculator import TorchATMCalculator, TorchD4Calculator
 from .atm import ATMResult, atm_dispersion

@@ -3,15 +3,13 @@
 import numpy as np
 import pytest
 import torch
-from conftest import BOHR, DEVICES, HAS_NVALCHEMI, names, random_cell, structures
+from conftest import BOHR, DEVICES, names, random_cell, structures
 
-from torch_atm.neighbors import NeighborMatrix, brute_force_neighbors
-
-pytestmark = pytest.mark.skipif(not HAS_NVALCHEMI, reason="nvalchemiops not installed")
+from torch_dispersion.neighbors import NeighborMatrix, brute_force_neighbors
 
 
 def nvalchemi(*args, **kwargs):
-    from torch_atm.neighbors.nvalchemi import NvalchemiBuilder
+    from torch_dispersion.neighbors.nvalchemi import NvalchemiBuilder
 
     return NvalchemiBuilder(**kwargs)(*args)
 

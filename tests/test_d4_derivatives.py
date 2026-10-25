@@ -8,7 +8,7 @@ import torch
 from conftest import DEVICES, make_d4_settings, random_cell, random_cluster, run_d4, structures
 from torch._dynamo.utils import counters
 
-import torch_atm.d4.dispersion as d4_module
+import torch_dispersion.d4.dispersion as d4_module
 
 H_POS = 2.5e-5  # Å (close contacts: the FD truncation error is ~3e-9 at 1e-4)
 H_STRAIN = 1e-5

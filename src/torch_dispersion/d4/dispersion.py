@@ -1,6 +1,6 @@
 """Orchestration: ``d4_dispersion(...) -> D4Result`` (dftd4 4.3.0 ``get_dispersion``).
 
-Gradient strategy, as for the D3 ATM term (``torch_atm.atm``):
+Gradient strategy, as for the D3 ATM term (``torch_dispersion.atm``):
 
 1. graph stage (autograd): positions and strain -> D4 CN, EEQ CN -> EEQ charges (Coulomb matrix,
    bordered solve) -> charge-scaled reference weights -> C6(q) (two-body) and C6(q = 0) (ATM);

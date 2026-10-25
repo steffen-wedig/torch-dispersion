@@ -1,7 +1,7 @@
 #!/bin/bash -l
 # Benchmark on one H200 (pinned: timings depend on the hardware).
 # Submit from the repository root: sbatch scripts/slurm/benchmark.sbatch [benchmark.py args]
-#SBATCH --job-name=torch_atm_benchmark
+#SBATCH --job-name=torch_dispersion_benchmark
 #SBATCH --account=mpo_inst
 #SBATCH --partition=gpu1
 #SBATCH --nodes=1

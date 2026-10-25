@@ -20,12 +20,12 @@ import numpy as np
 import torch
 from ase.io import read
 
-from torch_atm.atm import pad_positions
-from torch_atm.d4 import d4_dispersion, eeq
-from torch_atm.d4.data import d4_reference_data
-from torch_atm.d4.dispersion import _charges
-from torch_atm.neighbors import make_builder
-from torch_atm.settings import BruteForceNeighbors, D4Settings, NvalchemiNeighbors
+from torch_dispersion.atm import pad_positions
+from torch_dispersion.d4 import d4_dispersion, eeq
+from torch_dispersion.d4.data import d4_reference_data
+from torch_dispersion.d4.dispersion import _charges
+from torch_dispersion.neighbors import make_builder
+from torch_dispersion.settings import BruteForceNeighbors, D4Settings, NvalchemiNeighbors
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 # r2SCAN-D4

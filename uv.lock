@@ -1523,19 +1523,15 @@ wheels = [
 ]
 
 [[package]]
-name = "torch-atm"
+name = "torch-dispersion"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "ase" },
     { name = "numpy" },
+    { name = "nvalchemi-toolkit-ops", extra = ["torch"] },
     { name = "pydantic" },
     { name = "torch" },
-]
-
-[package.optional-dependencies]
-nvalchemi = [
-    { name = "nvalchemi-toolkit-ops", extra = ["torch"] },
 ]
 
 [package.dev-dependencies]
@@ -1554,13 +1550,12 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ase", specifier = ">=3.23" },
+    { name = "ase", specifier = ">=3.29" },
     { name = "numpy", specifier = ">=1.26" },
-    { name = "nvalchemi-toolkit-ops", extras = ["torch"], marker = "extra == 'nvalchemi'", specifier = "==0.4.1" },
+    { name = "nvalchemi-toolkit-ops", extras = ["torch"], specifier = "==0.4.1" },
     { name = "pydantic", specifier = ">=2.7" },
     { name = "torch", specifier = ">=2.6" },
 ]
-provides-extras = ["nvalchemi"]
 
 [package.metadata.requires-dev]
 dev = [
