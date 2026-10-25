@@ -102,10 +102,17 @@ stress are supported for molecules and 3D cells.
 ```python
 from torch_dispersion import D4Settings, TorchD4Calculator, d4_dispersion
 
-settings = D4Settings(s8=0.60187490, a1=0.51559235, a2=5.77342911)  # r2SCAN-D4 (bj-eeq-atm)
+settings = D4Settings.from_functional("r2scan", device="cuda")  # r2SCAN-D4 (bj-eeq-atm)
 result = d4_dispersion(numbers, positions, cell, pbc=True, settings=settings, charge=0.0)
 atoms.calc = TorchD4Calculator(settings)
 ```
+
+`from_functional` looks up the damping parameters (s6, s8, s9, a1, a2, alp) in a frozen copy of
+dftd4 4.3.0's `d4.bj-eeq-atm` table (118 functionals, `D4Settings.functionals()`). Names are
+case-insensitive and otherwise exact (`r2scan-3c`, `pbe0_2`). `atm=False` sets s9 = 0, which
+drops the ATM term and its 40 bohr neighbour list. Other keyword arguments set any field
+(device, compile, cutoffs, neighbour backend); the parameters can also be given by hand,
+`D4Settings(s8=..., a1=..., a2=...)`.
 
 It reuses the tiled ATM kernel and adds a tiled two-body kernel. The periodic EEQ replicates
 multicharge's fixed-range Ewald sums. Energies and virials match dftd4 to ~1e-17 Hartree, and

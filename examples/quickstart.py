@@ -25,9 +25,6 @@ from torch_dispersion import (
     d4_dispersion,
 )
 
-# r2SCAN-D4: the functional's d4.bj-eeq-atm entry in dftd4's parameters.toml
-R2SCAN_D4 = {"s8": 0.60187490, "a1": 0.51559235, "a2": 5.77342911}
-
 
 def water_box(n_side: int = 3, spacing: float = 3.1) -> Atoms:
     """n_side^3 water molecules on a slightly jittered grid in a cubic cell (~1 g/cm^3)."""
@@ -48,14 +45,8 @@ def make_settings(device: str) -> tuple[D4Settings, ATMSettings]:
     gpu = device == "cuda"
     # nvalchemiops (warp) neighbour lists on the GPU; the brute-force reference list on the CPU
     backend = NvalchemiNeighbors() if gpu else BruteForceNeighbors()
-    d4 = D4Settings(
-        s8=R2SCAN_D4["s8"],
-        a1=R2SCAN_D4["a1"],
-        a2=R2SCAN_D4["a2"],
-        device=device,
-        compile=gpu,
-        neighbor_backend=backend,
-    )
+    # r2SCAN-D4: the functional's d4.bj-eeq-atm entry in dftd4's parameters.toml
+    d4 = D4Settings.from_functional("r2scan", device=device, compile=gpu, neighbor_backend=backend)
     atm = ATMSettings(device=device, compile=gpu, neighbor_backend=backend)
     if not gpu:
         d4 = d4.model_copy(
