@@ -16,7 +16,8 @@ first term; its specification is [`docs/design.md`](docs/design.md).
 ## Installation
 
 ```bash
-uv sync    # torch, ase, numpy, pydantic, nvalchemiops (warp neighbour lists)
+uv sync                      # torch, ase, numpy, pydantic, nvalchemiops (warp neighbour lists)
+uv sync --extra torchsim     # + torch-sim, for torch_dispersion.torchsim.D4Model
 ```
 
 `torch.compile` on **CPU** needs a C++20 compiler (inductor); on DAIS run `module load gcc/15`
@@ -120,6 +121,24 @@ molecular gradients to ~1e-18 Hartree/bohr.
 
 The oracle is `dftd4==4.3.0`. dftd4 up to 4.1.0 had a wrong periodic ATM gradient, fixed in
 4.1.1; see [`docs/d4.md`](docs/d4.md).
+
+### TorchSim
+
+`D4Model` is a batched TorchSim `ModelInterface`. It needs the `torchsim` extra
+(`uv sync --extra torchsim`); the core package never imports torch-sim.
+
+```python
+from torch_sim.models.interface import SumModel
+from torch_dispersion.torchsim import D4Model
+
+model = SumModel(mlip, D4Model(settings))  # energy (S,), forces (N, 3), stress (S, 3, 3)
+```
+
+The neighbour list is built once for the whole batch (nvalchemiops, `system_idx`-aware). CN,
+EEQ (one total charge per system), C6 and the tile kernels run per system, on that system's C6
+block. Each system's result equals `d4_dispersion` on it. A batch must be all periodic or all
+molecular. Design, outputs, limits and timings:
+[`docs/d4.md#torchsim-model-batched`](docs/d4.md#torchsim-model-batched).
 
 ## How it works (real-space ATM)
 

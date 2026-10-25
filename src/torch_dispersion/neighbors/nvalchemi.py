@@ -54,11 +54,72 @@ class NvalchemiBuilder:
                 f"max_neighbors={matrix.shape[1]}; set NvalchemiNeighbors.max_neighbors higher"
             )
         width = int(count.max()) if n else 0
-        mask = torch.arange(width, device=matrix.device)[None, :] < count[:, None]
-        indices = torch.where(mask, matrix[:, :width].to(torch.int64), n)
+        return _to_matrix(matrix, count, out[2] if pbc else None, 0, width)
+
+    def batch(
+        self, positions: Tensor, cells: Tensor | None, pbc: bool, cutoff: float, counts: list[int]
+    ) -> list[NeighborMatrix]:
+        """Lists of a batch of systems concatenated along the atom axis (``counts`` atoms each,
+        cells (S, 3, 3) or None without PBC), from one batched (``system_idx``-aware) library
+        call. Each returned matrix has system-local indices, as from ``__call__`` per system."""
+        device = positions.device
+        positions = positions.detach()
+        n_total, n_systems = positions.shape[0], len(counts)
+        sizes = torch.tensor(counts, device=device)
+        ptr = torch.nn.functional.pad(torch.cumsum(sizes, 0), (1, 0)).to(torch.int32)
+        system = torch.repeat_interleave(torch.arange(n_systems, device=device), sizes)
+        max_neighbors = self.max_neighbors or _estimate_batch(counts, cells, pbc, cutoff)
+        kwargs: dict = {
+            "max_neighbors": max_neighbors,
+            "fill_value": n_total,
+            "batch_idx": system.to(torch.int32),
+            "batch_ptr": ptr,
+        }
+        if self.method is not None:
+            kwargs["method"] = self.method
         if pbc:
-            shifts = out[2][:, :width].to(torch.int64)
-            shifts = torch.where(mask[..., None], shifts, 0)
-        else:
-            shifts = torch.zeros((n, width, 3), dtype=torch.int64, device=matrix.device)
-        return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)
+            assert cells is not None
+            kwargs["cell"] = cells.detach().to(positions.dtype)
+            kwargs["pbc"] = torch.ones((n_systems, 3), dtype=torch.bool, device=device)
+        out = self._neighbor_list(positions, cutoff, **kwargs)
+        matrix, count = out[0], out[1].to(torch.int64)
+        # one host sync for the overflow check and the per-system widths
+        widths = torch.zeros(n_systems, dtype=torch.int64, device=device)
+        widths = widths.scatter_reduce(0, system, count, "amax").tolist()
+        if max(widths) > matrix.shape[1]:
+            raise RuntimeError(
+                f"nvalchemiops neighbour overflow: {max(widths)} neighbours for "
+                f"max_neighbors={matrix.shape[1]}; set NvalchemiNeighbors.max_neighbors higher"
+            )
+        result, start = [], 0
+        for n, width in zip(counts, widths, strict=True):
+            rows = slice(start, start + n)
+            shifts = out[2][rows] if pbc else None
+            result.append(_to_matrix(matrix[rows], count[rows], shifts, start, width))
+            start += n
+        return result
+
+
+def _estimate_batch(counts: list[int], cells: Tensor | None, pbc: bool, cutoff: float) -> int:
+    """``estimate_max_neighbors`` of the densest system of a batch (one host sync)."""
+    if not pbc:
+        return max(max(counts), 1)
+    assert cells is not None
+    volumes = torch.linalg.det(cells.to(torch.float64)).abs().tolist()
+    density = max(n / v for n, v in zip(counts, volumes, strict=True))
+    return math.ceil(HEADROOM * density * 4.0 / 3.0 * math.pi * cutoff**3) + MIN_EXTRA
+
+
+def _to_matrix(
+    matrix: Tensor, count: Tensor, shifts: Tensor | None, offset: int, width: int
+) -> NeighborMatrix:
+    """Library rows (indices offset by ``offset``) as a NeighborMatrix of ``width`` columns,
+    padded with the local atom count."""
+    n = matrix.shape[0]
+    mask = torch.arange(width, device=matrix.device)[None, :] < count[:, None]
+    indices = torch.where(mask, matrix[:, :width].to(torch.int64) - offset, n)
+    if shifts is not None:
+        shifts = torch.where(mask[..., None], shifts[:, :width].to(torch.int64), 0)
+    else:
+        shifts = torch.zeros((n, width, 3), dtype=torch.int64, device=matrix.device)
+    return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)
