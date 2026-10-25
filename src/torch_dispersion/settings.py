@@ -1,6 +1,9 @@
 """Configuration models (pydantic, yaml-loadable)."""
 
-from typing import Annotated, Literal
+import json
+from functools import cache
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 import ase.units
 import torch
@@ -136,11 +139,20 @@ class FourierATMSettings(_KernelSettings):
         return SMOOTH_CN_CUTOFF_BOHR if self.coordination == "smooth_cut" else 40.0
 
 
+D4_FUNCTIONALS_PATH = Path(__file__).parent / "d4" / "functionals.json"
+"""Frozen ``d4.bj-eeq-atm`` table of dftd4 4.3.0 (``scripts/export_d4_functionals.py``)."""
+
+
+@cache
+def _d4_functionals() -> dict[str, dict[str, float]]:
+    return json.loads(D4_FUNCTIONALS_PATH.read_text())["functionals"]
+
+
 class D4Settings(_EvalSettings):
     """DFT-D4 (dftd4 4.3.0 ``d4`` model, EEQ-2019 charges) with rational (Becke-Johnson)
     damping: two-body term plus ATM three-body term. The damping parameters are the functional's
     ``d4.bj-eeq-atm`` entry of dftd4's ``parameters.toml`` (e.g. r2SCAN: s8 = 0.60187490,
-    a1 = 0.51559235, a2 = 5.77342911)."""
+    a1 = 0.51559235, a2 = 5.77342911); ``from_functional`` looks them up."""
 
     s6: float = 1.0
     s8: float
@@ -157,3 +169,25 @@ class D4Settings(_EvalSettings):
     pair_tile_size: int = Field(default=4096, gt=0)
     """Neighbour tile width of the two-body kernel (``centre_block_size`` x ``pair_tile_size``
     pairs per call); also the padding bucket of its neighbour axis."""
+
+    @classmethod
+    def from_functional(cls, name: str, atm: bool = True, **overrides: Any) -> "D4Settings":
+        """Settings with the damping parameters of functional ``name`` (case-insensitive,
+        otherwise exact: ``r2scan-3c``, ``pbe0_2``). The entry's parameters (s6, s8, s9, a1,
+        a2, alp, merged onto dftd4's defaults) come first, then ``atm=False`` sets s9 = 0 (no
+        three-body term), then ``overrides`` (any field: device, compile, cutoffs, ...)."""
+        table = _d4_functionals()
+        key = name.lower()
+        if key not in table:
+            raise ValueError(
+                f"unknown D4 functional {name!r}; available: {', '.join(sorted(table))}"
+            )
+        params: dict[str, Any] = dict(table[key])
+        if not atm:
+            params["s9"] = 0.0
+        return cls(**{**params, **overrides})
+
+    @staticmethod
+    def functionals() -> list[str]:
+        """Names accepted by ``from_functional`` (lower case, sorted)."""
+        return sorted(_d4_functionals())
