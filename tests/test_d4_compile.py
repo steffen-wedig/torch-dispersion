@@ -117,8 +117,9 @@ def test_new_system_size_does_not_recompile(device):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(
     ("field", "value", "graphs"),
-    # the pair kernel is one graph, the analytic ATM kernel two (pointwise and reduction)
-    [("pair_tile_size", 1024, 1), ("neighbor_tile_size", 96, 2)],
+    # the pair kernel is one graph, the analytic ATM kernel two (pointwise and reduction);
+    # buckets no other test module uses (test_compile.py compiles the ATM kernel at T = 96)
+    [("pair_tile_size", 1024, 1), ("neighbor_tile_size", 80, 2)],
 )
 def test_new_tile_shape_compiles_once(field, value, graphs, device):
     """A new kernel bucket compiles that kernel once and nothing else, for any system."""

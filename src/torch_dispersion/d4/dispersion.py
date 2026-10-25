@@ -202,6 +202,55 @@ def run_pair_tiles(
     return acc
 
 
+@dataclass(frozen=True)
+class _Terms:
+    """Which terms run, and the cutoff of the one neighbour list per system (bohr)."""
+
+    two_body: bool
+    three_body: bool
+    list_cutoff: float
+
+
+def _terms(settings: D4Settings) -> _Terms:
+    eps = torch.finfo(torch.float64).eps
+    two = abs(settings.s6) >= eps or abs(settings.s8) >= eps
+    three = abs(settings.s9) >= eps
+    cutoffs = [settings.coordination_cutoff_bohr, eeq.CN_CUTOFF]
+    cutoffs += [settings.two_body_cutoff_bohr] * two + [settings.three_body_cutoff_bohr] * three
+    return _Terms(two_body=two, three_body=three, list_cutoff=max(cutoffs))
+
+
+def neighbor_list_cutoff(settings: D4Settings) -> float:
+    """Cutoff (bohr) of the neighbour list ``evaluate_system`` takes: the largest of the D4 CN,
+    EEQ CN, two-body (if s6 or s8 != 0) and ATM (if s9 != 0) ranges."""
+    return _terms(settings).list_cutoff
+
+
+def check_numbers(numbers: Tensor, data: D4ReferenceData) -> None:
+    if int(numbers.min()) < 1 or int(numbers.max()) > data.max_number:
+        raise ValueError(f"atomic numbers must be in 1..{data.max_number}")
+
+
+def to_bohr(x: Tensor, settings: D4Settings) -> Tensor:
+    """Positions or a cell (Å) as a detached tensor in bohr, in the settings' dtype and device."""
+    x = torch.as_tensor(x).detach().to(device=settings.torch_device, dtype=settings.torch_dtype)
+    return x / settings.bohr_in_angstrom
+
+
+def _empty_result(compute_forces: bool, compute_stress: bool, device) -> D4Result:
+    f64 = torch.float64
+    z = torch.zeros((), dtype=f64, device=device)
+    return D4Result(
+        energy=z,
+        forces=torch.zeros((0, 3), dtype=f64, device=device) if compute_forces else None,
+        stress=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
+        virial=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
+        two_body_energy=z,
+        three_body_energy=z,
+        charges=torch.zeros((0,), dtype=f64, device=device),
+    )
+
+
 def d4_dispersion(
     numbers: Tensor,
     positions: Tensor,
@@ -219,92 +268,164 @@ def d4_dispersion(
     ASE sign convention), virial dE/dε (eV); stress and virial are None without PBC.
     """
     pbc = check_pbc(pbc)
-    device, dtype = settings.torch_device, settings.torch_dtype
-    f64 = torch.float64
+    device = settings.torch_device
     numbers = torch.as_tensor(numbers).to(device=device, dtype=torch.int64)
-    n = numbers.shape[0]
     if pbc and cell is None:
         raise ValueError("a cell is required with pbc")
-    compute_stress = compute_stress and pbc
-    if n == 0:
-        z = torch.zeros((), dtype=f64, device=device)
-        empty = torch.zeros((0,), dtype=f64, device=device)
-        return D4Result(
-            energy=z,
-            forces=torch.zeros((0, 3), dtype=f64, device=device) if compute_forces else None,
-            stress=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
-            virial=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
-            two_body_energy=z,
-            three_body_energy=z,
-            charges=empty,
-        )
-    data = d4_reference_data(device, dtype)
-    if int(numbers.min()) < 1 or int(numbers.max()) > data.max_number:
-        raise ValueError(f"atomic numbers must be in 1..{data.max_number}")
-    bohr, hartree = settings.bohr_in_angstrom, settings.hartree_in_ev
-    pos = torch.as_tensor(positions).detach().to(device=device, dtype=dtype) / bohr
-    cell_b = torch.as_tensor(cell).detach().to(device=device, dtype=dtype) / bohr if pbc else None
+    if numbers.shape[0] == 0:
+        return _empty_result(compute_forces, compute_stress and pbc, device)
+    check_numbers(numbers, d4_reference_data(device, settings.torch_dtype))
+    pos = to_bohr(positions, settings)
+    cell_b = to_bohr(cell, settings) if pbc and cell is not None else None
+    # neighbour list (no autograd): one build at the largest cutoff, the others by masking
+    builder = make_builder(settings.neighbor_backend)
+    nl_all = builder(pos, cell_b, pbc, neighbor_list_cutoff(settings))
+    return evaluate_system(
+        numbers, pos, cell_b, cell, nl_all, settings, charge, compute_forces, compute_stress
+    )
 
-    # neighbour lists (no autograd): one build at the largest cutoff, the others by masking
-    c2, c3 = settings.two_body_cutoff_bohr, settings.three_body_cutoff_bohr
-    ccn = settings.coordination_cutoff_bohr
-    do_two = abs(settings.s6) >= torch.finfo(f64).eps or abs(settings.s8) >= torch.finfo(f64).eps
-    do_three = abs(settings.s9) >= torch.finfo(f64).eps
-    cutoffs = [ccn, eeq.CN_CUTOFF] + [c2] * do_two + [c3] * do_three
-    r_max = max(cutoffs)
-    nl_all = make_builder(settings.neighbor_backend)(pos, cell_b, pbc, r_max)
+
+def evaluate_system(
+    numbers: Tensor,
+    pos: Tensor,
+    cell_b: Tensor | None,
+    cell: Tensor | None,
+    nl_all: NeighborMatrix,
+    settings: D4Settings,
+    charge: float,
+    compute_forces: bool,
+    compute_stress: bool,
+) -> D4Result:
+    """D4 of one system from checked inputs: int64 ``numbers`` (n >= 1) on the settings device,
+    positions and cell (None without PBC) in bohr from ``to_bohr``, the cell in Å (for the
+    volume), and a neighbour list of ``pos`` at ``neighbor_list_cutoff(settings)``.
+
+    Runs the three stages of the module docstring. Every tensor is sized by this one system, so
+    the batched TorchSim model (``torch_dispersion.d4.batched``) calls it once per system."""
+    device, dtype = settings.torch_device, settings.torch_dtype
+    data = d4_reference_data(device, dtype)
+    pbc = cell_b is not None
+    compute_stress = compute_stress and pbc
+    need_grad = compute_forces or compute_stress
+    n = numbers.shape[0]
+    terms = _terms(settings)
     _check_coincident(nl_all, pos, cell_b)
 
     def restricted(r: float) -> NeighborMatrix:
-        return nl_all if r >= r_max else nl_all.restrict(pos, cell_b, r)
+        return nl_all if r >= terms.list_cutoff else nl_all.restrict(pos, cell_b, r)
 
-    block, tile, pair_tile = (
-        settings.centre_block_size,
-        settings.neighbor_tile_size,
-        settings.pair_tile_size,
-    )
-    n_padded = round_up(n + 1, block)
-    nl_cn = restricted(ccn).pad(n_padded, CN_WIDTH_MULTIPLE)
-    nl_eeq = restricted(eeq.CN_CUTOFF).pad(n_padded, CN_WIDTH_MULTIPLE)
+    n_padded = round_up(n + 1, settings.centre_block_size)
     system = _pad_system(numbers, n_padded, data)
 
     # stage 1: CN, charges and C6 with autograd
-    need_grad = compute_forces or compute_stress
     pos_leaf = pos.clone().requires_grad_(compute_forces)
     strain = torch.zeros((3, 3), dtype=dtype, device=device, requires_grad=compute_stress)
     deform = torch.eye(3, dtype=dtype, device=device) + strain
     pos_s = pos_leaf @ deform if pbc else pos_leaf
     cell_s = cell_b @ deform if cell_b is not None else None
     with torch.set_grad_enabled(need_grad):
-        pos_p = pad_positions(pos_s, n_padded)
-        cn, cn_eeq = _maybe_compiled(_coordination_numbers, settings.compile)(
-            nl_cn.vectors(pos_p, cell_s),
-            nl_cn.mask,
-            nl_cn.indices,
-            nl_eeq.vectors(pos_p, cell_s),
-            nl_eeq.mask,
-            nl_eeq.indices,
-            system.rcov,
-            system.en,
-            ccn,
-        )
-        q = _charges(numbers, pos_s, cell_s, cell_b, cn_eeq[:n], data, charge)
-        q_p = torch.nn.functional.pad(q.to(dtype), (0, n_padded - n))
-        c6_q, c6_0 = _maybe_compiled(_c6_pair, settings.compile)(
-            cn,
-            q_p,
-            system.reference_cn,
-            system.reference_q,
-            system.n_gaussians,
-            system.zeff,
-            system.hardness,
-            system.species,
-            system.c6_species,
+        q, c6_q, c6_0 = _graph_stage(
+            system, pos_s, cell_s, cell_b, restricted, settings, data, charge
         )
 
     # stage 2: blocked two-body pairs and ATM triples on detached C6
     pos_d = pad_positions(pos_s.detach(), n_padded)
     cell_d = None if cell_s is None else cell_s.detach()
+    acc2, acc3 = _tile_stage(
+        system, pos_d, cell_d, c6_q.detach(), c6_0.detach(), restricted, terms, settings, data,
+        need_grad,
+    )  # fmt: skip
+
+    def energy_of(acc) -> Tensor:
+        if acc is None:
+            return torch.zeros((), dtype=torch.float64, device=device)
+        return acc.energy if isinstance(acc, Accumulators) else acc
+
+    hartree, bohr = settings.hartree_in_ev, settings.bohr_in_angstrom
+    e2, e3 = energy_of(acc2), energy_of(acc3)
+    forces = stress = virial = None
+    if need_grad:
+        # stage 3: close the chain through CN, charges -> C6
+        grad_pos, grad_strain = _close_chain(
+            [(c6_q, acc2), (c6_0, acc3)], pos_leaf, strain, n, compute_forces, compute_stress
+        )
+        if grad_pos is not None:
+            forces = -grad_pos * (hartree / bohr)
+        if grad_strain is not None:
+            assert cell is not None
+            virial = grad_strain * hartree
+            volume = torch.linalg.det(torch.as_tensor(cell).to(device=device, dtype=torch.float64))
+            stress = 0.5 * (virial + virial.T) / volume.abs()
+    return D4Result(
+        energy=(e2 + e3) * hartree,
+        forces=forces,
+        stress=stress,
+        virial=virial,
+        two_body_energy=e2 * hartree,
+        three_body_energy=e3 * hartree,
+        charges=q.detach().to(torch.float64),
+    )
+
+
+def _graph_stage(
+    system: _System,
+    pos_s: Tensor,
+    cell_s: Tensor | None,
+    cell_b: Tensor | None,
+    restricted,
+    settings: D4Settings,
+    data: D4ReferenceData,
+    charge: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Stage 1 on the (strained) positions: EEQ charges (n,), C6(q) and C6(q = 0) (Np, Np)."""
+    n, n_padded = system.n, system.numbers.shape[0]
+    ccn = settings.coordination_cutoff_bohr
+    nl_cn = restricted(ccn).pad(n_padded, CN_WIDTH_MULTIPLE)
+    nl_eeq = restricted(eeq.CN_CUTOFF).pad(n_padded, CN_WIDTH_MULTIPLE)
+    pos_p = pad_positions(pos_s, n_padded)
+    cn, cn_eeq = _maybe_compiled(_coordination_numbers, settings.compile)(
+        nl_cn.vectors(pos_p, cell_s),
+        nl_cn.mask,
+        nl_cn.indices,
+        nl_eeq.vectors(pos_p, cell_s),
+        nl_eeq.mask,
+        nl_eeq.indices,
+        system.rcov,
+        system.en,
+        ccn,
+    )
+    q = _charges(system.numbers[:n], pos_s, cell_s, cell_b, cn_eeq[:n], data, charge)
+    q_p = torch.nn.functional.pad(q.to(settings.torch_dtype), (0, n_padded - n))
+    c6_q, c6_0 = _maybe_compiled(_c6_pair, settings.compile)(
+        cn,
+        q_p,
+        system.reference_cn,
+        system.reference_q,
+        system.n_gaussians,
+        system.zeff,
+        system.hardness,
+        system.species,
+        system.c6_species,
+    )
+    return q, c6_q, c6_0
+
+
+def _tile_stage(
+    system: _System,
+    pos_d: Tensor,
+    cell_d: Tensor | None,
+    c6_q: Tensor,
+    c6_0: Tensor,
+    restricted,
+    terms: _Terms,
+    settings: D4Settings,
+    data: D4ReferenceData,
+    need_grad: bool,
+):
+    """Stage 2 on detached C6: the two-body and ATM accumulators (None for a skipped term)."""
+    device, dtype = settings.torch_device, settings.torch_dtype
+    n, n_padded = system.n, system.numbers.shape[0]
+    block = settings.centre_block_size
     r4r2 = data.r4r2
     rr = 3.0 * r4r2[:, None] * r4r2[None, :]
     r0 = settings.a1 * torch.sqrt(rr) + settings.a2
@@ -312,93 +433,90 @@ def d4_dispersion(
     def zero():
         if need_grad:
             return zero_accumulators(n_padded, device)
-        return torch.zeros((), dtype=f64, device=device)
+        return torch.zeros((), dtype=torch.float64, device=device)
 
     acc2 = acc3 = None
-    if do_two:
-        nl2 = restricted(c2).pad(n_padded, pair_tile)
+    if terms.two_body:
+        c2 = settings.two_body_cutoff_bohr
+        nl2 = restricted(c2).pad(n_padded, settings.pair_tile_size)
         step2 = get_pair_step_fn(need_grad, settings.compile)
         scal2 = pair_scalars(settings.s6, settings.s8, c2, dtype, device)
         acc2 = run_pair_tiles(
             step2,
             zero(),
-            c6_q.detach(),
+            c6_q,
             nl2,
             nl2.vectors(pos_d, cell_d),
             system.numbers,
             n,
             block,
-            pair_tile,
+            settings.pair_tile_size,
             rr,
             r0,
             scal2,
         )
-    if do_three:
-        nl3 = restricted(c3).pad(n_padded, tile)
+    if terms.three_body:
+        c3 = settings.three_body_cutoff_bohr
+        nl3 = restricted(c3).pad(n_padded, settings.neighbor_tile_size)
         # the kernel's exponent is (alpha + 2) / 3; D4 uses alp / 3
         scal3 = KernelParams(s9=settings.s9, alpha=settings.alp - 2.0, cutoff=c3, width=0.0)
         step3 = get_step_fn(need_grad, settings.compile, settings.kernel_gradient)
         acc3 = run_tiles(
             step3,
             zero(),
-            (c6_0.detach(),),
+            (c6_0,),
             nl3,
             nl3.vectors(pos_d, cell_d),
             system.numbers,
             n,
             block,
-            tile,
+            settings.neighbor_tile_size,
             r0,
             scal3.scalars(dtype, device),
         )
+    return acc2, acc3
 
-    def energy_of(acc) -> Tensor:
-        if acc is None:
-            return torch.zeros((), dtype=f64, device=device)
-        return acc.energy if isinstance(acc, Accumulators) else acc
 
-    e2, e3 = energy_of(acc2), energy_of(acc3)
-    forces = stress = virial_out = None
-    if need_grad:
-        # stage 3: close the chain through CN, charges -> C6
-        accs = [(c6, a) for c6, a in ((c6_q, acc2), (c6_0, acc3)) if a is not None]
-        leaves = [pos_leaf] if compute_forces else []
-        leaves += [strain] if compute_stress else []
-        explicit_pos = sum(
-            (a.grad_pos for _, a in accs), torch.zeros((n_padded, 3), dtype=f64, device=device)
-        )
-        explicit_virial = sum(
-            (a.virial for _, a in accs), torch.zeros((3, 3), dtype=f64, device=device)
-        )
-        outputs = [c6 for c6, _ in accs if c6.requires_grad]
-        grads = [a.grad_c6.to(c6.dtype) for c6, a in accs if c6.requires_grad]
-        chain = [torch.zeros_like(x) for x in leaves]
-        if outputs:
-            chain = [
-                torch.zeros_like(x) if g is None else g
-                for x, g in zip(
-                    leaves,
-                    torch.autograd.grad(outputs, leaves, grad_outputs=grads, allow_unused=True),
-                    strict=True,
-                )
-            ]
-        if compute_forces:
-            gradient = explicit_pos[:n] + chain.pop(0).to(f64)
-            forces = -gradient * (hartree / bohr)
-        if compute_stress:
-            assert cell is not None
-            virial_out = (explicit_virial + chain.pop(0).to(f64)) * hartree
-            volume = torch.linalg.det(torch.as_tensor(cell).to(device=device, dtype=f64)).abs()
-            stress = 0.5 * (virial_out + virial_out.T) / volume
-    return D4Result(
-        energy=(e2 + e3) * hartree,
-        forces=forces,
-        stress=stress,
-        virial=virial_out,
-        two_body_energy=e2 * hartree,
-        three_body_energy=e3 * hartree,
-        charges=q.detach().to(f64),
+def _close_chain(
+    pairs, pos_leaf: Tensor, strain: Tensor, n: int, compute_forces: bool, compute_stress: bool
+) -> tuple[Tensor | None, Tensor | None]:
+    """Stage 3: total dE/dR (n, 3) and dE/dε (3, 3) in float64 (None if not requested): the
+    kernels' explicit parts plus one ``autograd.grad`` of dE/dC6 through the graph stage.
+    ``pairs`` are (C6 with its graph, accumulators or None for a skipped term)."""
+    f64 = torch.float64
+    device = pos_leaf.device
+    accs = [(c6, a) for c6, a in pairs if a is not None]
+    n_padded = accs[0][1].grad_pos.shape[0] if accs else n
+    leaves = [pos_leaf] if compute_forces else []
+    leaves += [strain] if compute_stress else []
+    explicit_pos = sum(
+        (a.grad_pos for _, a in accs), torch.zeros((n_padded, 3), dtype=f64, device=device)
     )
+    explicit_virial = sum(
+        (a.virial for _, a in accs), torch.zeros((3, 3), dtype=f64, device=device)
+    )
+    outputs = [c6 for c6, _ in accs if c6.requires_grad]
+    grads = [a.grad_c6.to(c6.dtype) for c6, a in accs if c6.requires_grad]
+    chain = [torch.zeros_like(x) for x in leaves]
+    if outputs:
+        chain = [
+            torch.zeros_like(x) if g is None else g
+            for x, g in zip(
+                leaves,
+                torch.autograd.grad(outputs, leaves, grad_outputs=grads, allow_unused=True),
+                strict=True,
+            )
+        ]
+    grad_pos = explicit_pos[:n] + chain.pop(0).to(f64) if compute_forces else None
+    grad_strain = explicit_virial + chain.pop(0).to(f64) if compute_stress else None
+    return grad_pos, grad_strain
 
 
-__all__ = ["D4Result", "d4_dispersion"]
+__all__ = [
+    "D4Result",
+    "check_numbers",
+    "d4_dispersion",
+    "evaluate_system",
+    "neighbor_list_cutoff",
+    "to_bohr",
+]
