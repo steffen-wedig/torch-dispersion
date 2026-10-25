@@ -1,4 +1,4 @@
-"""The batched TorchSim model ``torch_dispersion.torchsim.D4Model``.
+"""The batched TorchSim model ``torch_dispersion.calculators.torchsim.D4Model``.
 
 Every system of a batch must equal ``d4_dispersion`` on that system alone (energy, forces,
 stress, charges): exactly with the brute-force backend on the CPU (same per-system lists, same
@@ -19,7 +19,7 @@ from torch_sim.models.interface import SumModel, validate_model_outputs  # noqa:
 from torch_sim.models.soft_sphere import SoftSphereModel  # noqa: E402
 from torch_sim.typing import SystemExtras  # noqa: E402
 
-from torch_dispersion.torchsim import D4Model  # noqa: E402
+from torch_dispersion.calculators.torchsim import D4Model  # noqa: E402
 
 SHORT = {
     "two_body_cutoff_bohr": 25.0,

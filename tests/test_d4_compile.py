@@ -11,9 +11,9 @@ import torch
 from conftest import DEVICES, make_d4_settings, random_cell, run_d4
 from torch._dynamo.utils import counters
 
-from torch_dispersion.d4 import two_body
+from torch_dispersion.core.tiles import zero_accumulators
 from torch_dispersion.d4.data import d4_reference_data
-from torch_dispersion.kernel import zero_accumulators
+from torch_dispersion.pairwise import rational
 
 SHORT = {
     "two_body_cutoff_bohr": 25.0,
@@ -38,7 +38,7 @@ def dummy_tile(device, block=4, tile=16, n=9, box=30.0, cutoff=20.0):
     mask = (torch.rand(block, tile, generator=g) > 0.2).to(device) & (idx != centre[:, None])
     r4r2 = d4_reference_data(torch.device(device), f64).r4r2
     rr = 3.0 * r4r2[:, None] * r4r2[None, :]
-    inputs = two_body.PairTileInputs(
+    inputs = rational.PairTileInputs(
         centre=centre,
         idx=idx,
         mask=mask,
@@ -49,7 +49,7 @@ def dummy_tile(device, block=4, tile=16, n=9, box=30.0, cutoff=20.0):
     )
     c6 = (torch.rand(n, n, generator=g, dtype=f64) * 30 + 1).to(device)
     c6 = 0.5 * (c6 + c6.T)
-    scalars = two_body.pair_scalars(1.0, 0.6, cutoff, f64, torch.device(device))
+    scalars = rational.pair_scalars(1.0, 0.6, cutoff, f64, torch.device(device))
     return pos, c6, inputs, scalars
 
 
@@ -69,8 +69,8 @@ def test_pair_kernel_fullgraph(with_grad, device):
             return zero_accumulators(c6.shape[0], torch.device(device))
         return torch.zeros((), dtype=torch.float64, device=device)
 
-    compiled = two_body.get_pair_step_fn(with_grad, compile=True)(zero(), v, c6, t, s)
-    eager = two_body.get_pair_step_fn(with_grad, compile=False)(zero(), v, c6, t, s)
+    compiled = rational.get_pair_step_fn(with_grad, compile=True)(zero(), v, c6, t, s)
+    eager = rational.get_pair_step_fn(with_grad, compile=False)(zero(), v, c6, t, s)
     compiled = compiled if with_grad else [compiled]
     eager = eager if with_grad else [eager]
     assert float(eager[0]) != 0.0
@@ -86,11 +86,11 @@ def test_pair_gradients_match_autograd(compile, device):
     pos_leaf, c6_leaf = pos.clone().requires_grad_(), c6.clone().requires_grad_()
     v = vectors(pos_leaf, t)
     zero = torch.zeros((), dtype=torch.float64, device=device)
-    energy = two_body.energy_step(zero, v, c6_leaf, t, s)
+    energy = rational.energy_step(zero, v, c6_leaf, t, s)
     grad_pos, grad_c6, grad_v = torch.autograd.grad(energy, (pos_leaf, c6_leaf, v))
     virial = torch.einsum("btx,bty->xy", v.detach(), grad_v)
 
-    step = two_body.get_pair_step_fn(True, compile)
+    step = rational.get_pair_step_fn(True, compile)
     acc = step(zero_accumulators(c6.shape[0], torch.device(device)), v.detach(), c6, t, s)
     assert bool(grad_pos.abs().sum() > 0) and bool(grad_c6.abs().sum() > 0)
     torch.testing.assert_close(acc.energy, energy.detach(), rtol=1e-14, atol=0)

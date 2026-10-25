@@ -165,21 +165,34 @@ generated with these). Tests always use the fixture manifest's constants.
 ## 5. Architecture
 
 ```
-torch_atm/
+torch_dispersion/
   settings.py          pydantic models (ATMSettings, NeighborBackend union, Units)
-  data.py              reference tables → tensors (per device/dtype cache)
   neighbors/
     base.py            NeighborMatrix dataclass + NeighborBackend protocol
     brute_force.py     naive torch backend (all pairs × all translations)
     nvalchemi.py       nvalchemiops backend
-  coordination.py      CN from a NeighborMatrix
-  c6.py                reference weights, C6 matrix
-  kernel.py            compiled triple-block kernel (§6)
-  atm.py               orchestration: atm_dispersion(...) -> ATMResult
-  two_body.py          TEST-ONLY D3(BJ) two-body energy (validates C6, §8 T1)
-  ase_calculator.py    TorchATMCalculator
+  core/
+    inputs.py          input checks, Å -> bohr
+    padding.py         padding to the centre block size
+    coordination.py    CN from a NeighborMatrix (one routine, model counting functions)
+    c6.py              C6 matrix from reference weights
+    tiles.py           tile layout and loop, accumulators
+    chain.py           strained leaves, compiled graph stage, chain closure (§5.4)
+  d3/
+    data.py            reference tables → tensors (per device/dtype cache)
+    model.py           D3 counting function, reference weights
+  atm/
+    kernel.py          compiled triple-block kernel (§6)
+    realspace.py       orchestration: atm_dispersion(...) -> ATMResult
+  pairwise/
+    rational.py        BJ two-body kernel (D4; validates the D3 C6 in §8 T1)
+  calculators/
+    ase.py             TorchATMCalculator
 tests/
 ```
+
+(This is the current layout; the package started as `torch_atm` with these modules at the top
+level. FourierATM and D4 are documented in `docs/fourier_atm.md` and `docs/d4.md`.)
 
 ### 5.1 Configuration (pydantic, yaml-loadable, discriminated on `kind`)
 
@@ -371,7 +384,8 @@ default, and the full-cutoff liquid boxes as `slow`. Every test parametrizes ove
 `neighbor_backend ∈ {brute_force, nvalchemi}` and `compile ∈ {False, True}` unless noted,
 and over `device ∈ {cpu, cuda}` when CUDA is available.
 
-- **T1 C6 model via the two-body energy.** The test-only `two_body.py` computes D3(BJ)
+- **T1 C6 model via the two-body energy.** The test feeds this package's D3 C6 to the BJ
+  two-body kernel (`pairwise/rational.py`, shared with D4), which computes D3(BJ)
   E_2 = −½ Σ_{i,j,T} C6_ij [s6 / (r⁶ + R⁶) + s8 · rr_ij / (r⁸ + R⁸)], with
   rr_ij = 3 · r4r2_i · r4r2_j (so C8 = C6 · rr_ij), R = a1 · sqrt(rr_ij) + a2, the `r4r2` table
   (tad-dftd3 `data.r4r2` = simple-dftd3 `data/r4r2.f90`), a 60 bohr hard cutoff, and this

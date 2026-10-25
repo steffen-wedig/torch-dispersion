@@ -1,16 +1,17 @@
-"""Fixed-shape two-body kernel of D4 with rational (Becke-Johnson) damping.
+"""Fixed-shape two-body kernel with rational (Becke-Johnson) damping, as in DFT-D3(BJ) and D4.
 
-One call evaluates B centres i against one T-wide tile of their neighbour lists (full list, both
-i -> j and j -> i, so every pair carries 1/2):
+The kernel is independent of the C6 model: it takes C6 (Np, Np) and the (Z, Z) tables of
+``rational_tables``. One call evaluates B centres i against one T-wide tile of their neighbour
+lists (full list, both i -> j and j -> i, so every pair carries 1/2):
 
     E = -1/2 sum_{i, (j, T)} C6_ij [s6 / (r^6 + R0^6) + s8 rr_ij / (r^8 + R0^8)],
     rr_ij = 3 r4r2_i r4r2_j,  R0 = a1 sqrt(rr_ij) + a2,
 
-for eps <= r^2 <= cutoff^2 (dftd4 ``rational.f90``). Like the ATM kernel, the heavy tensors are
-(B, T) with B and T fixed by the settings, C6 (Np, Np) and the accumulators are the only
-system-sized inputs (marked dynamic), and parameters are 0-d tensors. Gradients are analytic:
-with u = r^2, de/du = -1/2 C6 (-3 s6 u^2 t6^2 - 4 s8 rr u^3 t8^2), and dE/dC6_ij is the
-geometric factor itself.
+for eps <= r^2 <= cutoff^2 (dftd4 and simple-dftd3 ``rational.f90``). Like the ATM kernel, the
+heavy tensors are (B, T) with B and T fixed by the settings, C6 (Np, Np) and the accumulators
+are the only system-sized inputs (marked dynamic), and parameters are 0-d tensors. Gradients
+are analytic: with u = r^2, de/du = -1/2 C6 (-3 s6 u^2 t6^2 - 4 s8 rr u^3 t8^2), and dE/dC6_ij
+is the geometric factor itself.
 """
 
 from functools import cache
@@ -19,7 +20,7 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from ..kernel import Accumulators
+from ..core.tiles import Accumulators, TileLayout
 
 
 class PairScalars(NamedTuple):
@@ -36,6 +37,30 @@ class PairTileInputs(NamedTuple):
     z: Tensor  # (B, T)
     rr: Tensor  # (Z, Z) 3 r4r2_i r4r2_j
     r0: Tensor  # (Z, Z) a1 sqrt(rr) + a2
+
+
+def rational_tables(r4r2: Tensor, a1: float, a2: float) -> tuple[Tensor, Tensor]:
+    """(rr, R0) (Z, Z) from the r4r2 table: rr = 3 r4r2_i r4r2_j, R0 = a1 sqrt(rr) + a2."""
+    rr = 3.0 * r4r2[:, None] * r4r2[None, :]
+    return rr, a1 * torch.sqrt(rr) + a2
+
+
+def pair_inputs(rr: Tensor, r0: Tensor):
+    """``make_inputs`` of ``core.tiles.run_tiles`` (order 1) for tile p of a block."""
+
+    def make(layout: TileLayout, kb: int, tiles: tuple[int, ...]) -> PairTileInputs:
+        (p,) = tiles
+        return PairTileInputs(
+            centre=layout.centres[kb],
+            idx=layout.indices[kb, p],
+            mask=layout.mask[kb, p],
+            z_centre=layout.z_centres[kb],
+            z=layout.z[kb, p],
+            rr=rr,
+            r0=r0,
+        )
+
+    return make
 
 
 def pair_scalars(s6: float, s8: float, cutoff: float, dtype, device) -> PairScalars:

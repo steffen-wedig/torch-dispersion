@@ -18,7 +18,7 @@ import torch
 from ase.io import read
 
 from torch_dispersion.atm import atm_dispersion
-from torch_dispersion.fourier import fourier_atm
+from torch_dispersion.atm.fourier import fourier_atm
 from torch_dispersion.settings import ATMSettings, FourierATMSettings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"

@@ -6,8 +6,8 @@ Per triangle with all legs within the short-range cutoff (switched by the quinti
     k_D3 = s9/3 sqrt(C6_ij C6_ik C6_jk),   k_CP = s9/3 sum_r mu_r a_ir a_nr a_mr,
 
 so that trace (all triangles, undamped, k_CP) + correction = D3 inside the cutoff. The tiling,
-padding and counting are those of ``torch_dispersion.kernel``; this adds the (Np, R) factor table
-``a`` as a second system-sized input and its gradient.
+padding and counting are those of ``torch_dispersion.atm.kernel``; this adds the (Np, R) factor
+table ``a`` as a second system-sized input and its gradient.
 """
 
 from functools import cache
@@ -16,8 +16,8 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
+from ...core.tiles import Accumulators
 from ..kernel import (
-    Accumulators,
     KernelScalars,
     TileInputs,
     _accumulate,

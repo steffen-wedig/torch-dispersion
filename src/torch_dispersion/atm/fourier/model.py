@@ -5,10 +5,10 @@
 
 1. graph stage: positions and strain -> CN -> reference weights -> C6 (Np, Np) and the CP
    factors a (Np, R), with autograd;
-2. short-range triple stage on detached C6 and a (``torch_dispersion.atm.run_tiles``), accumulating
-   dE/dR, the virial, dE/dC6 and dE/da;
+2. short-range triple stage on detached C6 and a (``core.tiles.run_tiles``), accumulating dE/dR,
+   the virial, dE/dC6 and dE/da;
 3. the dense trace with autograd through a, the positions and the cell, and one
-   ``torch.autograd.grad`` that closes both chains.
+   ``torch.autograd.grad`` that closes both chains (``core.chain.close_chain``).
 
 Internally bohr and Hartree; the API takes and returns Å and eV.
 """
@@ -16,26 +16,19 @@ Internally bohr and Hartree; the API takes and returns Å and eV.
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import cache
 
 import torch
 from torch import Tensor
 
-from ..atm import (
-    CN_WIDTH_MULTIPLE,
-    _check_coincident,
-    check_pbc,
-    pad_positions,
-    pad_system,
-    round_up,
-    run_tiles,
-)
-from ..c6 import pairwise_c6, reference_weights
-from ..coordination import coordination_number, smooth_coordination_number
-from ..data import check_numbers, reference_data
-from ..kernel import KernelParams
-from ..neighbors import make_builder
-from ..settings import FourierATMSettings
+from ...core.chain import close_chain, forces_and_stress, graph_fn, strained, zero_outputs
+from ...core.inputs import check_coincident, check_numbers, prepare
+from ...core.padding import CN_WIDTH_MULTIPLE, pad_positions, padded_size
+from ...core.tiles import TileLayout, run_tiles
+from ...d3.data import pad_system, reference_data
+from ...d3.model import cn_weights_c6
+from ...neighbors import make_builder
+from ...settings import FourierATMSettings
+from ..kernel import KernelParams, triple_inputs
 from .cp import CPFit, fit_c9
 from .dipole import (
     EwaldSetup,
@@ -80,16 +73,11 @@ def _stage1(
 ) -> tuple[Tensor, Tensor]:
     """(C6 (Np, Np), a (Np, R)) of the padded system."""
     vec = nl.vectors(positions, cell)
-    cn_fn = smooth_coordination_number if smooth else coordination_number
-    cn = cn_fn(vec, nl.mask, rcov, rcov[nl.indices], cutoff)
-    weights = reference_weights(cn, ref_cn, ref_mask)
+    _, weights, c6 = cn_weights_c6(
+        vec, nl.mask, nl.indices, rcov, ref_cn, ref_mask, species, c6_species, cutoff, smooth
+    )
     a = torch.einsum("ip,ipr->ir", weights, factors[numbers])
-    return pairwise_c6(weights, species, c6_species), a
-
-
-@cache
-def _compiled_stage1():
-    return torch.compile(_stage1, fullgraph=True, dynamic=True)
+    return c6, a
 
 
 def ewald_parameters(real_cutoff: float, accuracy: float) -> tuple[float, float]:
@@ -174,15 +162,13 @@ def separable_c9(
     settings: FourierATMSettings,
 ) -> tuple[Tensor, Tensor]:
     """(a (N, R), mu (R,)) of the separable C9 for a structure (Å), float64, no autograd."""
+    inputs = prepare(numbers, positions, cell, pbc, settings)
     device, dtype = settings.torch_device, settings.torch_dtype
-    numbers = torch.as_tensor(numbers).to(device=device, dtype=torch.int64)
+    numbers, pos, cell_b = inputs.numbers, inputs.positions, inputs.cell
     n = numbers.shape[0]
     data = reference_data(device, dtype)
     fit = fit_c9(tuple(sorted(set(numbers.tolist()))), settings.cp_rank)
-    bohr = settings.bohr_in_angstrom
-    pos = torch.as_tensor(positions).to(device=device, dtype=dtype) / bohr
-    cell_b = torch.as_tensor(cell).to(device=device, dtype=dtype) / bohr if pbc else None
-    nl = make_builder(settings.neighbor_backend)(pos, cell_b, pbc, settings.cn_cutoff)
+    nl = make_builder(settings.neighbor_backend)(pos, cell_b, inputs.pbc, settings.cn_cutoff)
     system = pad_system(numbers, n + 1, data)
     _, a = _stage1(
         pad_positions(pos, n + 1),
@@ -211,34 +197,27 @@ def fourier_atm(
     compute_stress: bool = True,
 ) -> FourierATMResult:
     """Cutoff-free D3 ATM three-body dispersion. Positions and cell (rows) in Å."""
-    pbc = check_pbc(pbc)
+    inputs = prepare(numbers, positions, cell, pbc, settings)
     device, dtype = settings.torch_device, settings.torch_dtype
-    f64 = torch.float64
-    numbers = torch.as_tensor(numbers).to(device=device, dtype=torch.int64)
+    numbers, pos, cell_b, pbc = inputs.numbers, inputs.positions, inputs.cell, inputs.pbc
     n = numbers.shape[0]
-    if pbc and cell is None:
-        raise ValueError("a cell is required with pbc")
     compute_stress = compute_stress and pbc
     need_grad = compute_forces or compute_stress
     data = reference_data(device, dtype)
-    check_numbers(numbers, data)
+    check_numbers(numbers, data.max_number)
     fit: CPFit = fit_c9(tuple(sorted(set(numbers.tolist()))), settings.cp_rank)
-    zero = torch.zeros((), dtype=f64, device=device)
     if settings.s9 == 0.0 or n == 0:
+        zero, forces, stress, virial = zero_outputs(n, compute_forces, compute_stress, device)
         return FourierATMResult(
             energy=zero,
-            forces=torch.zeros((n, 3), dtype=f64, device=device) if compute_forces else None,
-            stress=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
-            virial=torch.zeros((3, 3), dtype=f64, device=device) if compute_stress else None,
+            forces=forces,
+            stress=stress,
+            virial=virial,
             trace_energy=zero,
             short_range_energy=zero,
             q_grid=None,
             cp_max_rel_error=fit.max_rel_error,
         )
-
-    bohr, hartree = settings.bohr_in_angstrom, settings.hartree_in_ev
-    pos = torch.as_tensor(positions).detach().to(device=device, dtype=dtype) / bohr
-    cell_b = torch.as_tensor(cell).detach().to(device=device, dtype=dtype) / bohr if pbc else None
 
     # neighbour lists: CN, short-range triangles and (periodic) the Ewald real-space pairs
     r_s, r_cn = settings.short_range_cutoff_bohr, settings.cn_cutoff
@@ -246,13 +225,13 @@ def fourier_atm(
     r_max = max(r_s, r_cn, r_ew if pbc else 0.0)
     builder = make_builder(settings.neighbor_backend)
     nl_all = builder(pos, cell_b, pbc, r_max)
-    _check_coincident(nl_all, pos, cell_b)
+    check_coincident(nl_all, pos, cell_b)
 
     def restricted(cutoff: float):
         return nl_all if cutoff >= r_max else nl_all.restrict(pos, cell_b, cutoff)
 
     block, tile = settings.centre_block_size, settings.neighbor_tile_size
-    n_padded = round_up(n + 1, block)
+    n_padded = padded_size(n, block)
     nl_cn = restricted(r_cn).pad(n_padded, CN_WIDTH_MULTIPLE)
     nl_sr = restricted(r_s).pad(n_padded, tile)
     system = pad_system(numbers, n_padded, data)
@@ -260,14 +239,10 @@ def fourier_atm(
     mu = fit.weights.to(device=device, dtype=dtype)
 
     # stage 1: CN -> weights -> C6 and a, with autograd
-    pos_leaf = pos.clone().requires_grad_(compute_forces)
-    strain = torch.zeros((3, 3), dtype=dtype, device=device, requires_grad=compute_stress)
-    deform = torch.eye(3, dtype=dtype, device=device) + strain
-    pos_s = pos_leaf @ deform if pbc else pos_leaf
-    cell_s = cell_b @ deform if cell_b is not None else None
-    stage1 = _compiled_stage1() if settings.compile else _stage1
+    geometry = strained(pos, cell_b, compute_forces, compute_stress)
+    pos_s, cell_s = geometry.positions, geometry.cell
     with torch.set_grad_enabled(need_grad):
-        c6, a = stage1(
+        c6, a = graph_fn(_stage1, settings.compile)(
             pad_positions(pos_s, n_padded),
             cell_s,
             nl_cn,
@@ -283,34 +258,27 @@ def fourier_atm(
         )
 
     # stage 2: short-range correction on detached C6 and a
-    c6_leaf, a_leaf = c6.detach(), a.detach()
     vec = nl_sr.vectors(
         pad_positions(pos_s.detach(), n_padded), None if cell_s is None else cell_s.detach()
     )
     base = KernelParams(
         s9=settings.s9, alpha=settings.alpha, cutoff=r_s, width=settings.short_range_width_bohr
     ).scalars(dtype, device)
-    scalars = SRScalars(base=base, mu=mu)
-    step = get_sr_step_fn(need_grad, settings.compile, settings.kernel_gradient)
     acc: Tensor | SRAccumulators
     acc = (
         zero_sr_accumulators(n_padded, settings.cp_rank, device)
         if need_grad
-        else torch.zeros((), dtype=f64, device=device)
+        else torch.zeros((), dtype=torch.float64, device=device)
     )
-    r0_table = settings.rs9 * data.r0_vdw
     acc = run_tiles(
-        step,
+        get_sr_step_fn(need_grad, settings.compile, settings.kernel_gradient),
         acc,
-        (c6_leaf, a_leaf),
-        nl_sr,
-        vec,
-        system.numbers,
-        system.n,
-        block,
-        tile,
-        r0_table,
-        scalars,
+        (c6.detach(), a.detach()),
+        TileLayout.build(nl_sr, vec, system.numbers, block, tile),
+        n,
+        2,
+        triple_inputs(settings.rs9 * data.r0_vdw),
+        SRScalars(base=base, mu=mu),
     )
     e_sr = acc.energy if isinstance(acc, SRAccumulators) else acc
 
@@ -336,39 +304,34 @@ def fourier_atm(
             e_tr = long_range_energy(pos_s, None, a[:n], mu64)
         e_tr = settings.s9 * e_tr
 
-    forces = stress = virial_out = None
+    forces = stress = virial = None
     if need_grad:
         assert isinstance(acc, SRAccumulators)
-        grad_pos, virial, grad_a = acc.grad_pos[:n], acc.virial, acc.grad_a
+        grad_pos, explicit_virial, grad_a = acc.grad_pos[:n], acc.virial, acc.grad_a
         if explicit is not None:
             s9 = settings.s9
             grad_pos = grad_pos + s9 * explicit.grad_pos
-            virial = virial + s9 * explicit.virial
+            explicit_virial = explicit_virial + s9 * explicit.virial
             grad_a = grad_a.clone()
             grad_a[:n] += s9 * explicit.grad_a
-        leaves = [pos_leaf] if compute_forces else []
-        leaves += [strain] if compute_stress else []
-        total = e_tr + (c6 * acc.grad_c6.to(c6.dtype)).sum() + (a * grad_a.to(a.dtype)).sum()
-        grads = torch.autograd.grad(total, leaves, allow_unused=True)
-        grads = [
-            torch.zeros_like(x) if g is None else g for x, g in zip(leaves, grads, strict=True)
-        ]
-        if compute_forces:
-            gradient = grad_pos + grads.pop(0).to(f64)
-            forces = -gradient * (hartree / bohr)
-        if compute_stress:
-            assert cell is not None
-            virial_out = (virial + grads.pop(0).to(f64)) * hartree
-            volume = torch.linalg.det(torch.as_tensor(cell).to(device=device, dtype=f64)).abs()
-            stress = 0.5 * (virial_out + virial_out.T) / volume
+        grads = close_chain(
+            geometry,
+            [e_tr, c6, a],
+            [torch.ones_like(e_tr), acc.grad_c6, grad_a],
+            grad_pos,
+            explicit_virial,
+            n,
+        )
+        forces, stress, virial = forces_and_stress(*grads, cell, settings)
     if explicit is not None:
         e_tr = e_tr + settings.s9 * explicit.energy
     e_tr = e_tr.detach()
+    hartree = settings.hartree_in_ev
     return FourierATMResult(
         energy=(e_tr + e_sr) * hartree,
         forces=forces,
         stress=stress,
-        virial=virial_out,
+        virial=virial,
         trace_energy=e_tr * hartree,
         short_range_energy=e_sr * hartree,
         q_grid=grid,

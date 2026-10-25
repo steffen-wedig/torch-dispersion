@@ -4,7 +4,7 @@ Importing this module imports ``torch_sim`` (the ``torchsim`` extra); the packag
 ``__init__`` does not import it, so the core install does not need torch-sim.
 
     from torch_sim.models.interface import SumModel
-    from torch_dispersion.torchsim import D4Model
+    from torch_dispersion.calculators.torchsim import D4Model
 
     model = SumModel(mlip, D4Model(D4Settings(s8=..., a1=..., a2=..., s9=0.0)))
 
@@ -19,8 +19,8 @@ import torch
 from torch_sim.models.interface import ModelInterface
 from torch_sim.state import SimState
 
-from .d4.batched import d4_dispersion_batched
-from .settings import D4Settings
+from ..d4.batched import d4_dispersion_batched
+from ..settings import D4Settings
 
 
 class D4Model(ModelInterface):

@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from ase.io import read
 
-from torch_dispersion.atm import pad_positions
+from torch_dispersion.core.padding import pad_positions
 from torch_dispersion.d4 import d4_dispersion, eeq
 from torch_dispersion.d4.data import d4_reference_data
 from torch_dispersion.d4.dispersion import _charges

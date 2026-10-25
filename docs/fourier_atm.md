@@ -1,6 +1,6 @@
 # FourierATM
 
-A cutoff-free version of the D3 ATM three-body term (`torch_dispersion.fourier`). It is built on the same CN-based D3 coefficients as the real-space term and involves no learned polarisabilities. It is meant to sit next to FourierD3 (two-body) and can share FourierD3's `smooth_cut` coordination number.
+A cutoff-free version of the D3 ATM three-body term (`torch_dispersion.atm.fourier`). It is built on the same CN-based D3 coefficients as the real-space term and involves no learned polarisabilities. It is meant to sit next to FourierD3 (two-body) and can share FourierD3's `smooth_cut` coordination number.
 
 Status (2026-09-30): implemented and tested.
 
@@ -31,7 +31,7 @@ This is the third-order term of MBD.
 C9_ijk ≈ Σ_r μ_r a_ir a_jr a_kr,    a_ir = Σ_p w_ip(CN_i) V_pr
 ```
 
-- V and μ are a symmetric CP decomposition of the reference tensor C9ref_pqs = sqrt(C6ref_pq C6ref_qs C6ref_sp) over the references of the species present (`fourier/cp.py`). This is the three-body analogue of FourierD3's eigen-decomposition of C6ref.
+- V and μ are a symmetric CP decomposition of the reference tensor C9ref_pqs = sqrt(C6ref_pq C6ref_qs C6ref_sp) over the references of the species present (`atm/fourier/cp.py`). This is the three-body analogue of FourierD3's eigen-decomposition of C6ref.
 - The fit works in normalised form, Y = C9ref / (d_p d_q d_s) with d = sqrt(diag C6ref). It uses LBFGS with restarts and takes about 1.5 s per species set. It is cached per process.
 - This is the D3 definition of C9, approximated. It is not an independent physical C9. The same engine accepts other coefficients, for example Casimir–Polder node values a_ir = α_i(iω_r), μ_r = W_r.
 
@@ -41,7 +41,7 @@ C9_ijk ≈ Σ_r μ_r a_ir a_jr a_kr,    a_ir = Σ_p w_ip(CN_i) V_pr
 E_bare = −(s9/18) Σ_r μ_r <Tr[(D_r A(q))^3]>_q,    D_r = diag(a_r) ⊗ 1₃
 ```
 
-- **The matrix A(q):** the 3N × 3N Bloch dipole matrix A_ij(q) = Σ_n T(x_j − x_i + n) e^{iq·n}, without the (i = j, n = 0) term (`fourier/dipole.py`). It is evaluated by Ewald summation:
+- **The matrix A(q):** the 3N × 3N Bloch dipole matrix A_ij(q) = Σ_n T(x_j − x_i + n) e^{iq·n}, without the (i = j, n = 0) term (`atm/fourier/dipole.py`). It is evaluated by Ewald summation:
   - an erfc real-space part over neighbour-list pairs;
   - one (3N × n_k)(n_k × 3N) complex matmul for the reciprocal part;
   - a self term.
@@ -76,7 +76,7 @@ D3's triangle damping fdmp = 1/(1 + 6 Π_l (r0_l/r_l)^{16/3}) does not factorise
 E = E_bare + Σ_{legs ≤ r_s} [C9_D3 fdmp − C9_CP] ang s(r_ij) s(r_ik) s(r_jk)
 ```
 
-- The correction is the real-space tile kernel with a second per-atom table a (`fourier/kernel.py`), with analytic and vjp gradients.
+- The correction is the real-space tile kernel with a second per-atom table a (`atm/fourier/kernel.py`), with analytic and vjp gradients.
 - Default r_s = 20 bohr with a 3-bohr quintic switch.
 - Inside r_s the result is exact D3. Outside it is undamped D3 with the CP C9.
 - The CP error cancels exactly inside r_s, because the same CP C9 appears in the trace and in the subtraction.
@@ -85,7 +85,7 @@ E = E_bare + Σ_{legs ≤ r_s} [C9_D3 fdmp − C9_CP] ang s(r_ij) s(r_ik) s(r_jk
 
 - **Stage 1:** CN → weights → C6 and a, with autograd.
 - **Stage 2:** the short-range tiles on detached C6 and a. They accumulate dE/dR, the virial, dE/dC6 and dE/da.
-- **Stage 3:** the periodic trace, with explicit gradients (`trace_gradient="analytic"`, the default, in `fourier/trace_grad.py`):
+- **Stage 3:** the periodic trace, with explicit gradients (`trace_gradient="analytic"`, the default, in `atm/fourier/trace_grad.py`):
   - **Trace:** dE/dA = Γ = −(w_q/6) Σ_r μ_r (M_r² D_r)ᵀ, and dE/da from 3·diag(A M²). Both reuse M² from the forward pass.
   - **Real space:** H_im = Re Σ_q Γ[(i,:),(j_m,:)]·phase contracts with the erfc dipole tensor through the Ewald radial functions B, C, D: dE/dv = −D (v·Hv) v + C (H + Hᵀ) v + C tr(H) v.
   - **Reciprocal space:** one matmul, Z = conj(W)(Γ + Γ^H). The forces are Σ_k k·Im(W∘Z). Under strain, the phases k·x are invariant and only h_k and k change, which gives a closed-form virial.

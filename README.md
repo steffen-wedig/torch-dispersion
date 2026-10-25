@@ -17,7 +17,7 @@ first term; its specification is [`docs/design.md`](docs/design.md).
 
 ```bash
 uv sync                      # torch, ase, numpy, pydantic, nvalchemiops (warp neighbour lists)
-uv sync --extra torchsim     # + torch-sim, for torch_dispersion.torchsim.D4Model
+uv sync --extra torchsim     # + torch-sim, for torch_dispersion.calculators.torchsim.D4Model
 ```
 
 `torch.compile` on **CPU** needs a C++20 compiler (inductor); on DAIS run `module load gcc/15`
@@ -129,7 +129,7 @@ The oracle is `dftd4==4.3.0`. dftd4 up to 4.1.0 had a wrong periodic ATM gradien
 
 ```python
 from torch_sim.models.interface import SumModel
-from torch_dispersion.torchsim import D4Model
+from torch_dispersion.calculators.torchsim import D4Model
 
 model = SumModel(mlip, D4Model(settings))  # energy (S,), forces (N, 3), stress (S, 3, 3)
 ```
@@ -139,6 +139,24 @@ EEQ (one total charge per system), C6 and the tile kernels run per system, on th
 block. Each system's result equals `d4_dispersion` on it. A batch must be all periodic or all
 molecular. Design, outputs, limits and timings:
 [`docs/d4.md#torchsim-model-batched`](docs/d4.md#torchsim-model-batched).
+
+## Package layout
+
+Everything public is importable from `torch_dispersion`; the TorchSim model is
+`torch_dispersion.calculators.torchsim.D4Model` (it needs the `torchsim` extra).
+
+```
+torch_dispersion/
+  settings.py      pydantic settings of every term
+  neighbors/       NeighborMatrix; brute-force and nvalchemiops backends
+  core/            shared machinery: input checks, padding, CN routine, C6 contraction,
+                   tile loops (tiles.py) and the graph stage / chain closure (chain.py)
+  d3/              D3 reference tables, CN counting functions, reference weights
+  atm/             triple kernel (kernel.py), real-space ATM (realspace.py), FourierATM (fourier/)
+  pairwise/        rational-damping (BJ) two-body kernel
+  d4/              D4 model, EEQ charges, D4 orchestration and its batched variant
+  calculators/     ASE calculators (ase.py), TorchSim model (torchsim.py)
+```
 
 ## How it works (real-space ATM)
 

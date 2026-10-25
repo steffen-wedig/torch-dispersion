@@ -9,16 +9,16 @@ import pytest
 import torch
 from conftest import make_fourier_settings, monomer_in_box, names, structures
 
-from torch_dispersion.fourier import separable_c9
-from torch_dispersion.fourier.cp import fit_c9
-from torch_dispersion.fourier.dipole import (
+from torch_dispersion.atm.fourier import separable_c9
+from torch_dispersion.atm.fourier.cp import fit_c9
+from torch_dispersion.atm.fourier.dipole import (
     EwaldSetup,
     grid_for_cell,
     molecular_dipole_matrix,
     q_grid,
     trace_energy,
 )
-from torch_dispersion.fourier.model import ewald_parameters, long_range_energy
+from torch_dispersion.atm.fourier.model import ewald_parameters, long_range_energy
 from torch_dispersion.neighbors import brute_force_neighbors
 
 F64 = torch.float64
@@ -166,10 +166,10 @@ def test_cp_fit(numbers):
 @pytest.mark.parametrize("name", ["glycerol_crystal", "emim_ntf2_crystal"])
 def test_separable_c9_matches_d3(name):
     """sum_r mu a a a against D3's sqrt(C6 C6 C6) for random atom triples."""
-    from torch_dispersion.atm import pad_positions, pad_system
-    from torch_dispersion.c6 import pairwise_c6, reference_weights
-    from torch_dispersion.coordination import coordination_number
-    from torch_dispersion.data import reference_data
+    from torch_dispersion.core.c6 import pairwise_c6
+    from torch_dispersion.core.padding import pad_positions
+    from torch_dispersion.d3.data import pad_system, reference_data
+    from torch_dispersion.d3.model import d3_coordination_number, reference_weights
 
     atoms = structures()[name]
     fs = make_fourier_settings(coordination="d3")
@@ -181,7 +181,7 @@ def test_separable_c9_matches_d3(name):
     nl = brute_force_neighbors(pos, cell_b, True, 40.0).pad(n + 1, 8)
     s = pad_system(torch.tensor(atoms.numbers), n + 1, data)
     vec = nl.vectors(pad_positions(pos, n + 1), cell_b)
-    cn = coordination_number(vec, nl.mask, s.rcov, s.rcov[nl.indices], 40.0)
+    cn = d3_coordination_number(vec, nl.mask, s.rcov, s.rcov[nl.indices], 40.0)
     c6 = pairwise_c6(reference_weights(cn, s.ref_cn, s.ref_mask), s.species, s.c6_species)
     rng = np.random.default_rng(0)
     t = torch.tensor(rng.integers(0, n, (4000, 3)))

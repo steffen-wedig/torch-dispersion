@@ -6,7 +6,7 @@ import pytest
 import torch
 from conftest import BACKENDS, DEVICES, make_settings, random_cell, random_cluster, run
 
-import torch_dispersion.atm as atm_module
+import torch_dispersion.atm.realspace as atm_module
 
 H_POS = 1e-4  # Å
 H_STRAIN = 1e-5
@@ -49,17 +49,16 @@ def fd_virial(atoms, settings) -> np.ndarray:
 def frozen_c6(monkeypatch):
     """Replace stage 1 by a constant C6 taken at the first call (CN held fixed)."""
     store = {}
+    stage1 = atm_module._stage1
 
-    def fake_stage1_fn(compile):
-        def fn(*args):
-            cn, c6 = atm_module._stage1(*args)
-            if "c6" not in store:
-                store["c6"] = c6.detach().clone()
-            return cn.detach(), store["c6"]
+    def frozen(*args):
+        cn, c6 = stage1(*args)
+        if "c6" not in store:
+            store["c6"] = c6.detach().clone()
+        return cn.detach(), store["c6"]
 
-        return fn
-
-    monkeypatch.setattr(atm_module, "stage1_fn", fake_stage1_fn)
+    monkeypatch.setattr(atm_module, "_stage1", frozen)
+    store["stage1"] = stage1
     return store
 
 
@@ -107,10 +106,9 @@ def test_cn_chain_contribution(system, frozen_c6):
         np.testing.assert_allclose(
             explicit.virial.cpu().numpy(), fd_virial(atoms, settings), rtol=0, atol=2e-8
         )
-    frozen_c6.clear()
     # a fresh, unfrozen evaluation for comparison
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(atm_module, "stage1_fn", lambda compile: atm_module._stage1)
+        mp.setattr(atm_module, "_stage1", frozen_c6["stage1"])
         full = run(atoms, settings)
     cn_part = (full.forces - explicit.forces).abs().max()
     assert cn_part > 1e-3 * full.forces.abs().max()

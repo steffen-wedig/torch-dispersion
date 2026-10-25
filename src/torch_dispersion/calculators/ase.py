@@ -5,10 +5,10 @@ import torch
 from ase.calculators.calculator import Calculator, PropertyNotImplementedError, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 
-from .atm import atm_dispersion, check_pbc
-from .d4 import d4_dispersion
-from .fourier import fourier_atm
-from .settings import ATMSettings, D4Settings, FourierATMSettings
+from ..atm import atm_dispersion, fourier_atm
+from ..core.inputs import check_pbc
+from ..d4 import d4_dispersion
+from ..settings import ATMSettings, D4Settings, FourierATMSettings
 
 
 class TorchATMCalculator(Calculator):

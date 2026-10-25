@@ -1,4 +1,4 @@
-"""Export the D3 reference tables into ``src/torch_dispersion/reference_data.pt``.
+"""Export the D3 reference tables into ``src/torch_dispersion/d3/reference_data.npz``.
 
 Sources (Apache-2.0): tad-dftd3 (reference CNs, reference C6, r4/r2 expectation values) and
 tad-mctc (D3 covalent radii, pairwise zero-damping vdW radii). All lengths are in bohr.
@@ -39,7 +39,8 @@ def _exact_bohr(table: torch.Tensor, decimals: int, scale: float = 1.0) -> torch
     return AATOAU * scale * angstrom
 
 
-OUT = Path(__file__).resolve().parents[1] / "src" / "torch_dispersion" / "reference_data.npz"
+OUT = Path(__file__).resolve().parents[1] / "src" / "torch_dispersion"
+OUT = OUT / "d3" / "reference_data.npz"
 
 
 def main() -> None:
