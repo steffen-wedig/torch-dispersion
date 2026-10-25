@@ -137,17 +137,19 @@ def run_tiles(
     tables: tuple[Tensor, ...],
     nl_atm: NeighborMatrix,
     vec: Tensor,
-    system: "PaddedSystem",
+    numbers: Tensor,
+    n: int,
     block: int,
     tile: int,
     r0_table: Tensor,
     scalars,
 ):
     """Loop over centre blocks and neighbour tile pairs: ``acc = step(acc, v_n, v_m, *tables,
-    inputs, scalars)``. ``tables`` are the system-sized per-atom inputs (C6 (Np, Np) first, then
-    (Np, ...) tables); their Np dimensions are marked dynamic (no-op without compilation)."""
+    inputs, scalars)``. ``numbers`` are the padded atomic numbers (Np,), ``n`` the real atoms.
+    ``tables`` are the system-sized per-atom inputs (C6 (Np, Np) first, then (Np, ...) tables);
+    their Np dimensions are marked dynamic (no-op without compilation)."""
     device = vec.device
-    n_padded = system.n_padded
+    n_padded = numbers.shape[0]
     for i, x in enumerate(tables):
         for d in (0, 1) if i == 0 else (0,):
             torch._dynamo.mark_dynamic(x, d)
@@ -159,14 +161,14 @@ def run_tiles(
         x = x.reshape(n_blocks, block, n_tiles_max, tile, *x.shape[2:])
         return x.transpose(1, 2).contiguous()
 
-    z_nb = system.numbers[nl_atm.indices]
+    z_nb = numbers[nl_atm.indices]
     idx_t, mask_t, z_t, vec_t = (tiled(x) for x in (nl_atm.indices, nl_atm.mask, z_nb, vec))
     centres = torch.arange(n_padded, device=device).reshape(n_blocks, block)
-    z_centres = system.numbers.reshape(n_blocks, block)
+    z_centres = numbers.reshape(n_blocks, block)
     diag = {flag: torch.tensor(flag, device=device) for flag in (True, False)}
     counts = nl_atm.count.reshape(n_blocks, block).amax(1).cpu().tolist()
     track = isinstance(acc, tuple)
-    for kb in range(-(-system.n // block)):
+    for kb in range(-(-n // block)):
         n_tiles = -(-int(counts[kb]) // tile)
         for p in range(n_tiles):
             for q in range(p, n_tiles):
@@ -281,7 +283,9 @@ def atm_dispersion(
         if need_grad
         else torch.zeros((), dtype=f64, device=device)
     )
-    acc = run_tiles(step, acc, (c6_leaf,), nl_atm, vec, system, block, tile, r0_table, scalars)
+    acc = run_tiles(
+        step, acc, (c6_leaf,), nl_atm, vec, system.numbers, n, block, tile, r0_table, scalars
+    )
 
     if isinstance(acc, Accumulators):
         energy, grad_pos, virial, grad_c6 = acc

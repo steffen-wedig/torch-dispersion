@@ -104,7 +104,8 @@ class AtomicUnits:
     virial: np.ndarray | None
 
 
-def to_atomic_units(result: ATMResult) -> AtomicUnits:
+def to_atomic_units(result) -> AtomicUnits:
+    """An ATMResult (or any result with energy, forces, virial) in atomic units."""
     return AtomicUnits(
         energy=float(result.energy) / HARTREE,
         gradient=None if result.forces is None else -result.forces.cpu().numpy() / (HARTREE / BOHR),
@@ -253,3 +254,110 @@ def monomer_in_box(name="benzamide_monomer_C7H7NO", box="orthorhombic") -> Atoms
     atoms.pbc = True
     atoms.positions += atoms.cell.array.sum(0) / 2 - atoms.positions.mean(0)
     return atoms
+
+
+# --------------------------------------------------------------------------------------------
+# DFT-D4 (oracle: dftd4 4.3.0; default cutoffs 60 / 40 / 30 bohr for disp2 / disp3 / CN)
+
+# r2SCAN-D4 (dftd4 parameters.toml, d4.bj-eeq-atm)
+D4_PARAMS = {
+    "s6": 1.0,
+    "s8": 0.60187490,
+    "s9": 1.0,
+    "a1": 0.51559235,
+    "a2": 5.77342911,
+    "alp": 16.0,
+}
+D4_DEFAULT_CUTOFFS = (60.0, 40.0, 30.0)
+# the fixture ions (formal charges) for the charged-system tests
+ION_CHARGES = {"emim_ntf2_monomer_C6H11N2": 1.0, "emim_ntf2_monomer_C2F6NO4S2": -1.0}
+
+
+def make_d4_settings(device="cpu", backend="brute_force", compile=False, **overrides):
+    from torch_atm.settings import D4Settings
+
+    kwargs = {
+        "device": device,
+        "compile": compile,
+        "neighbor_backend": backend_settings(backend),
+        **D4_PARAMS,
+        **UNITS,
+    }
+    kwargs.update(overrides)
+    return D4Settings(**kwargs)
+
+
+def d4_cutoff_settings(disp2: float, disp3: float, cn: float) -> dict[str, float]:
+    """``D4Settings`` overrides matching ``d4_oracle(..., cutoffs=(disp2, disp3, cn))``."""
+    return {
+        "two_body_cutoff_bohr": disp2,
+        "three_body_cutoff_bohr": disp3,
+        "coordination_cutoff_bohr": cn,
+    }
+
+
+def run_d4(atoms: Atoms, settings, charge: float = 0.0, **kwargs):
+    from torch_atm.d4 import d4_dispersion
+
+    pbc = bool(atoms.pbc.all())
+    return d4_dispersion(
+        torch.tensor(atoms.numbers),
+        torch.tensor(atoms.positions),
+        torch.tensor(atoms.cell.array) if pbc else None,
+        pbc,
+        settings,
+        charge=charge,
+        **kwargs,
+    )
+
+
+def _d4_model(numbers: tuple, positions: tuple, cell: tuple | None, charge: float):
+    from dftd4.interface import DispersionModel
+
+    pos = np.array(positions).reshape(-1, 3) / BOHR
+    lattice = None if cell is None else np.array(cell).reshape(3, 3) / BOHR
+    periodic = None if cell is None else np.array([True, True, True])
+    return DispersionModel(np.array(numbers), pos, charge, lattice, periodic)
+
+
+def _d4_key(atoms: Atoms, charge: float) -> tuple:
+    pbc = bool(atoms.pbc.all())
+    return (
+        tuple(atoms.numbers.tolist()),
+        tuple(atoms.positions.reshape(-1).tolist()),
+        tuple(atoms.cell.array.reshape(-1).tolist()) if pbc else None,
+        float(charge),
+    )
+
+
+@cache
+def _d4_oracle(numbers, positions, cell, charge, params: tuple, cutoffs: tuple, grad: bool):
+    from dftd4.interface import DampingParam
+
+    model = _d4_model(numbers, positions, cell, charge)
+    model.set_realspace_cutoff(*cutoffs)
+    res = model.get_dispersion(DampingParam(**dict(params)), grad=grad)
+    return {k: np.array(v) for k, v in res.items()}
+
+
+def d4_oracle(
+    atoms: Atoms,
+    charge: float = 0.0,
+    grad: bool = True,
+    cutoffs: tuple[float, float, float] = D4_DEFAULT_CUTOFFS,
+    **params,
+):
+    """dftd4 energy (Hartree), gradient (Hartree/bohr) and virial (Hartree) at the real-space
+    cutoffs (disp2, disp3, cn) in bohr."""
+    full = {**D4_PARAMS, **params}
+    return _d4_oracle(*_d4_key(atoms, charge), tuple(sorted(full.items())), cutoffs, grad)
+
+
+@cache
+def _d4_properties(numbers, positions, cell, charge):
+    return _d4_model(numbers, positions, cell, charge).get_properties()
+
+
+def d4_properties(atoms: Atoms, charge: float = 0.0) -> dict[str, np.ndarray]:
+    """CN, charges, C6 and polarisabilities at the default cutoffs."""
+    return _d4_properties(*_d4_key(atoms, charge))

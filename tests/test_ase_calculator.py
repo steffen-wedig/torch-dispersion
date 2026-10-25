@@ -75,3 +75,27 @@ def test_molecule_stress_not_implemented():
     atoms.calc = TorchATMCalculator(make_settings(**SHORT))
     with pytest.raises(PropertyNotImplementedError):
         atoms.get_stress()
+
+
+D4_SHORT = {"two_body_cutoff_bohr": 25.0, "three_body_cutoff_bohr": 16.0}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("name", ["dmso_crystal", "emim_ntf2_monomer_C6H11N2"])
+def test_d4_calculator_matches_functional_api(name, device):
+    from conftest import make_d4_settings, run_d4
+
+    from torch_atm.ase_calculator import TorchD4Calculator
+
+    settings = make_d4_settings(device, **D4_SHORT)
+    charge = 1.0 if "C6H11N2" in name else 0.0
+    atoms = structures()[name].copy()
+    d4 = TorchD4Calculator(settings, charge=charge)
+    atoms.calc = SumCalculator([d4, ConstantCalculator()])
+    r = run_d4(atoms, settings, charge)
+    assert atoms.get_potential_energy() == pytest.approx(float(r.energy) + 1.5, rel=0, abs=1e-12)
+    np.testing.assert_allclose(atoms.get_forces(), r.forces.cpu().numpy() + 0.25, atol=1e-12)
+    if atoms.pbc.all():
+        stress = full_3x3_to_voigt_6_stress(r.stress.cpu().numpy())
+        np.testing.assert_allclose(atoms.get_stress(), stress + 0.01, atol=1e-14)
+    assert d4.results["charges"].sum() == pytest.approx(charge, abs=1e-12)

@@ -33,15 +33,11 @@ class NvalchemiNeighbors(BaseModel):
 NeighborBackend = Annotated[BruteForceNeighbors | NvalchemiNeighbors, Field(discriminator="kind")]
 
 
-class _KernelSettings(BaseModel):
-    """Fields shared by the real-space ATM and FourierATM settings."""
+class _EvalSettings(BaseModel):
+    """Evaluation fields shared by every term (kernel shape, backends, units, device)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    s9: float = 1.0
-    alpha: float = 14.0
-    """The damping set's ``alp``; the ATM damping uses ``alpha + 2``."""
-    rs9: float = 4.0 / 3.0
     centre_block_size: int = Field(default=32, gt=0)
     """Centres per kernel call. Defaults (32, 512) from the H200 sweep: 0.30 s for energy, forces
     and stress of a 250-atom liquid at 40 bohr (B = 16: 0.34 s, B = 64: 0.28 s at 1.6x memory);
@@ -67,6 +63,15 @@ class _KernelSettings(BaseModel):
     @property
     def torch_device(self) -> torch.device:
         return torch.device(self.device)
+
+
+class _KernelSettings(_EvalSettings):
+    """Fields shared by the real-space ATM and FourierATM settings."""
+
+    s9: float = 1.0
+    alpha: float = 14.0
+    """The damping set's ``alp``; the ATM damping uses ``alpha + 2``."""
+    rs9: float = 4.0 / 3.0
 
 
 class ATMSettings(_KernelSettings):
@@ -129,3 +134,26 @@ class FourierATMSettings(_KernelSettings):
         if self.coordination_cutoff_bohr is not None:
             return self.coordination_cutoff_bohr
         return SMOOTH_CN_CUTOFF_BOHR if self.coordination == "smooth_cut" else 40.0
+
+
+class D4Settings(_EvalSettings):
+    """DFT-D4 (dftd4 4.3.0 ``d4`` model, EEQ-2019 charges) with rational (Becke-Johnson)
+    damping: two-body term plus ATM three-body term. The damping parameters are the functional's
+    ``d4.bj-eeq-atm`` entry of dftd4's ``parameters.toml`` (e.g. r2SCAN: s8 = 0.60187490,
+    a1 = 0.51559235, a2 = 5.77342911)."""
+
+    s6: float = 1.0
+    s8: float
+    s9: float = 1.0
+    a1: float
+    a2: float
+    alp: float = 16.0
+    """ATM damping exponent (used as is, unlike D3's ``alpha + 2``)."""
+    two_body_cutoff_bohr: float = Field(default=60.0, gt=0)
+    three_body_cutoff_bohr: float = Field(default=40.0, gt=0)
+    coordination_cutoff_bohr: float = Field(default=30.0, gt=0)
+    """Range of the D4 coordination number. The EEQ coordination number has its own fixed
+    25 bohr range (part of the EEQ-2019 model)."""
+    pair_tile_size: int = Field(default=4096, gt=0)
+    """Neighbour tile width of the two-body kernel (``centre_block_size`` x ``pair_tile_size``
+    pairs per call); also the padding bucket of its neighbour axis."""

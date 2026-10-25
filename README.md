@@ -76,6 +76,27 @@ FourierATM is within 0.001–0.006 meV/atom of the real-space sum at 80 bohr. Th
 
 Use float64. Method, validation and limits: [`docs/fourier_atm.md`](docs/fourier_atm.md).
 
+## DFT-D4
+
+`d4_dispersion` evaluates the full DFT-D4 dispersion term (dftd4 4.3.0 `d4` model). It covers EEQ
+charges, charge-scaled C6, the two-body rational damping and the ATM term. Energy, forces and
+stress are supported for molecules and 3D cells.
+
+```python
+from torch_atm import D4Settings, TorchD4Calculator, d4_dispersion
+
+settings = D4Settings(s8=0.60187490, a1=0.51559235, a2=5.77342911)  # r2SCAN-D4 (bj-eeq-atm)
+result = d4_dispersion(numbers, positions, cell, pbc=True, settings=settings, charge=0.0)
+atoms.calc = TorchD4Calculator(settings)
+```
+
+It reuses the tiled ATM kernel and adds a tiled two-body kernel. The periodic EEQ replicates
+multicharge's fixed-range Ewald sums. Energies and virials match dftd4 to ~1e-17 Hartree, and
+molecular gradients to ~1e-18 Hartree/bohr.
+
+The oracle is `dftd4==4.3.0`. dftd4 up to 4.1.0 had a wrong periodic ATM gradient, fixed in
+4.1.1; see [`docs/d4.md`](docs/d4.md).
+
 ## How it works
 
 1. **Graph stage** (autograd): positions and a zero strain → CN → Gaussian reference weights

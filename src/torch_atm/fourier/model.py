@@ -300,7 +300,17 @@ def fourier_atm(
     )
     r0_table = settings.rs9 * data.r0_vdw
     acc = run_tiles(
-        step, acc, (c6_leaf, a_leaf), nl_sr, vec, system, block, tile, r0_table, scalars
+        step,
+        acc,
+        (c6_leaf, a_leaf),
+        nl_sr,
+        vec,
+        system.numbers,
+        system.n,
+        block,
+        tile,
+        r0_table,
+        scalars,
     )
     e_sr = acc.energy if isinstance(acc, SRAccumulators) else acc
 
