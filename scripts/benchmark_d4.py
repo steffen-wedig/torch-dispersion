@@ -70,6 +70,9 @@ def eeq_call(atoms, settings, grad: bool):
     cell = torch.tensor(atoms.cell.array, device=device, dtype=f64) / bohr
     nl = make_builder(settings.neighbor_backend)(pos, cell, True, eeq.CN_CUTOFF)
     weights = torch.randn(len(atoms), device=device, dtype=f64)
+    rad, eta = data.eeq_rad[z], data.eeq_eta[z]
+    chi, kcnchi = data.eeq_chi[z], data.eeq_kcnchi[z]
+    total = torch.zeros((), dtype=f64, device=device)
 
     def fn():
         leaf = pos.clone().requires_grad_(grad)
@@ -82,7 +85,10 @@ def eeq_call(atoms, settings, grad: bool):
                 rc[z],
                 rc[zp][nl.indices],
             )
-            q = _charges(z, leaf, cell, cell, cn, data, 0.0)
+            alpha = torch.tensor(eeq.ewald_alpha(cell), dtype=f64, device=device)
+            pairs = eeq.wigner_seitz_images(leaf.detach(), cell)
+            a_dir = eeq.direct_coulomb(leaf, cell, rad, alpha, pairs, settings.compile)
+            q = _charges(cn, leaf, cell, a_dir, rad, eta, chi, kcnchi, alpha, total)
             if grad:
                 torch.autograd.grad((q * weights).sum(), leaf)
 

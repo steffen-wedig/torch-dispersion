@@ -1,9 +1,10 @@
 """Per-stage time of the batched D4 model, to plan fused/Triton kernels.
 
 Wraps the stage functions of ``d4_dispersion_batched`` with synchronising timers and reports,
-per batch and s9, the time in: the neighbour list, the coincidence check, the graph stage
-(split into CN, EEQ charges and C6), the two-body and ATM tile loops, the chain closure; plus the
-number of CUDA kernel launches of one batched call (torch.profiler).
+per batch and s9, the time in: the neighbour list, the coincidence check, the host-side EEQ
+setup and direct Coulomb sum, the compiled graph stage (CN, EEQ, C6), the two-body and ATM tile
+loops and the chain closure (the backward of the graph stage); plus the number of CUDA kernel
+launches of one batched call (torch.profiler).
 
     uv run python scripts/profile_d4_stages.py --device cuda
 """
@@ -46,14 +47,17 @@ def instrument() -> None:
     batched_module.build_batched = timed("neighbour list", batched_module.build_batched)
     d4.check_coincident = timed("coincidence check", d4.check_coincident)
     d4._pad_system = timed("padding + reference C6", d4._pad_system)
-    labels = {"_coordination_numbers": "CN (D4 + EEQ)", "_c6_pair": "C6(q), C6(0)"}
+    labels = {"_graph": "graph stage forward (CN, EEQ, C6)"}
     graph_fn = d4.graph_fn
 
     def timed_graph_fn(fn, compile: bool):  # wrap the compiled function, not the traced one
         return timed(labels[fn.__name__], graph_fn(fn, compile))
 
     d4.graph_fn = timed_graph_fn  # ty: ignore[invalid-assignment]
-    d4._charges = timed("EEQ charges", d4._charges)
+    eeq = d4.eeq
+    eeq.ewald_alpha = timed("EEQ setup: Ewald alpha", eeq.ewald_alpha)
+    eeq.wigner_seitz_images = timed("EEQ setup: Wigner-Seitz pairs", eeq.wigner_seitz_images)
+    eeq.direct_coulomb = timed("EEQ direct Coulomb forward", eeq.direct_coulomb)
     run_tiles = timed(
         "tiles", d4.run_tiles, lambda a, k: "two-body tiles" if a[5] == 1 else "ATM tiles"
     )

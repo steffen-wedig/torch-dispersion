@@ -18,9 +18,10 @@ Coulomb matrix uses Gaussian charges of width rad_i:
   one in its translation table; that is replicated too.)
 
 The reciprocal part is exactly periodic, so it factorises into structure factors (an N x 124
-matmul). The direct part is evaluated in pair chunks; its derivatives recompute each chunk under
-autograd in the backward pass, so memory stays bounded by one chunk. The solve is differentiated
-by autograd (``torch.linalg.solve``).
+matmul). The direct part is a reduction over the 125 translations per image pair, evaluated in
+pair chunks with a hand-written backward (``_DirectCoulomb``), so its memory stays bounded by
+one chunk and nothing is recomputed under autograd. The solve is differentiated by autograd
+(``torch.linalg.solve``).
 """
 
 import math
@@ -37,9 +38,10 @@ CN_CUTOFF = 25.0
 KCN = 7.5
 CN_MAX = 8.0
 _SQRT2PI = math.sqrt(2.0 / math.pi)
+_TWO_OVER_SQRTPI = 2.0 / math.sqrt(math.pi)
 _WS_THRESHOLD = math.sqrt(2.220446049250313e-16)
 _WS_TOLERANCE = 0.01
-_PAIR_CHUNK = 8192
+_PAIR_CHUNK = 16384
 
 
 def eeq_coordination_number(
@@ -187,20 +189,42 @@ def wigner_seitz_images(positions: Tensor, cell: Tensor) -> ImagePairs:
     return ImagePairs(i=i, j=j, shift=shift.to(positions.dtype), weight=weight.to(positions.dtype))
 
 
-def _direct_entries(
-    pos: Tensor, cell: Tensor, pairs: ImagePairs, gam_table: Tensor, alpha: float, sl: slice
-) -> Tensor:
-    """Direct-space Ewald sum of the image pairs ``sl``: w sum_T [erf(g r) - erf(alpha r)] / r
-    over the 5 x 5 x 5 block, skipping r < sqrt(eps)."""
-    i, j = pairs.i[sl], pairs.j[sl]
-    block = _direct_block(cell.device, cell.dtype) @ cell  # (125, 3)
-    vec = pos[j] - pos[i] + pairs.shift[sl] @ cell
-    r2 = (vec[:, None, :] + block).square().sum(-1)  # (P, 125)
+def _direct_sum(vec: Tensor, block: Tensor, gam: Tensor, alpha: Tensor) -> Tensor:
+    """sum_T [erf(g r) - erf(alpha r)] / r over the translations ``block`` (T, 3), r = |vec + T|,
+    skipping r < sqrt(eps); vec (P, 3), gam (P,)."""
+    d = vec[:, None, :] + block
+    r2 = d.square().sum(-1)
     keep = r2 >= _WS_THRESHOLD * _WS_THRESHOLD
-    r_safe = torch.sqrt(torch.where(keep, r2, 1.0))
-    gam = gam_table[i, j][:, None]
-    term = (torch.erf(gam * r_safe) - torch.erf(alpha * r_safe)) / r_safe
-    return pairs.weight[sl] * torch.where(keep, term, 0.0).sum(-1)
+    r = torch.sqrt(torch.where(keep, r2, 1.0))
+    term = (torch.erf(gam[:, None] * r) - torch.erf(alpha * r)) / r
+    return torch.where(keep, term, 0.0).sum(-1)
+
+
+def _direct_sum_grad(
+    vec: Tensor, block: Tensor, gam: Tensor, alpha: Tensor, g: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Derivatives of sum_e g_e ``_direct_sum``_e with respect to vec (P, 3) and block (T, 3):
+    d f / d r = 2 / sqrt(pi) (gam exp(-gam^2 r^2) - alpha exp(-alpha^2 r^2)) / r - f / r."""
+    d = vec[:, None, :] + block
+    r2 = d.square().sum(-1)
+    keep = r2 >= _WS_THRESHOLD * _WS_THRESHOLD
+    r2 = torch.where(keep, r2, 1.0)
+    r = torch.sqrt(r2)
+    gr = gam[:, None]
+    f = (torch.erf(gr * r) - torch.erf(alpha * r)) / r
+    gauss = gr * torch.exp(-gr * gr * r2) - alpha * torch.exp(-alpha * alpha * r2)
+    dfdr = (_TWO_OVER_SQRTPI * gauss - f) / r
+    dd = torch.where(keep, g[:, None] * dfdr / r, 0.0)[..., None] * d  # (P, T, 3)
+    return dd.sum(1), dd.sum(0)
+
+
+@cache
+def _compiled(fn):
+    return torch.compile(fn, fullgraph=True, dynamic=True)
+
+
+def _maybe_compiled(fn, compile: bool):
+    return _compiled(fn) if compile else fn
 
 
 @cache
@@ -222,42 +246,51 @@ def _scatter_symmetric(n: int, pairs: ImagePairs, values: Tensor) -> Tensor:
 
 
 class _DirectCoulomb(torch.autograd.Function):
-    """Direct-space part of the periodic Coulomb matrix; the backward pass recomputes each pair
-    chunk under autograd instead of keeping the (pairs x 125) graph."""
+    """Direct-space part of the periodic Coulomb matrix, w_e sum_T [erf(g r) - erf(alpha r)] / r
+    per image pair e over the 5 x 5 x 5 block, with an analytic backward. Both directions are
+    reductions over the block evaluated in pair chunks (``compile``: fused, dynamic shapes), so
+    no (pairs x 125) tensor is kept."""
 
     @staticmethod
-    def forward(ctx, pos, cell, pairs, gam_table, alpha):
+    def forward(ctx, pos, cell, pairs, gam_table, alpha, compile):
         n = pos.shape[0]
-        with torch.no_grad():
-            values = torch.cat(
-                [
-                    _direct_entries(pos, cell, pairs, gam_table, alpha, slice(s, s + _PAIR_CHUNK))
-                    for s in range(0, pairs.i.numel(), _PAIR_CHUNK)
-                ]
-            )
-        ctx.save_for_backward(pos, cell)
-        ctx.pairs, ctx.gam_table, ctx.alpha = pairs, gam_table, alpha
-        return _scatter_symmetric(n, pairs, values)
+        fn = _maybe_compiled(_direct_sum, compile)
+        block = _direct_block(cell.device, cell.dtype) @ cell
+        vec = pos[pairs.j] - pos[pairs.i] + pairs.shift @ cell
+        gam = gam_table[pairs.i, pairs.j]
+        values = torch.cat(
+            [
+                fn(vec[s : s + _PAIR_CHUNK], block, gam[s : s + _PAIR_CHUNK], alpha)
+                for s in range(0, vec.shape[0], _PAIR_CHUNK)
+            ]
+        )
+        ctx.save_for_backward(vec, block, gam, alpha)
+        ctx.pairs, ctx.n, ctx.compile = pairs, n, compile
+        return _scatter_symmetric(n, pairs, pairs.weight * values)
 
     @staticmethod
     def backward(ctx, *grad_outputs):
         (grad_a,) = grad_outputs
-        pos, cell = ctx.saved_tensors
+        vec, block, gam, alpha = ctx.saved_tensors
         pairs = ctx.pairs
         # d(sum grad_a * A) / d(entry e) = grad_a[i, j] + grad_a[j, i] off the diagonal
         g = grad_a[pairs.i, pairs.j]
         off = pairs.i != pairs.j
-        g = torch.where(off, g + grad_a[pairs.j, pairs.i], g)
-        grad_pos, grad_cell = torch.zeros_like(pos), torch.zeros_like(cell)
-        with torch.enable_grad():
-            p, c = pos.detach().requires_grad_(), cell.detach().requires_grad_()
-            for s in range(0, pairs.i.numel(), _PAIR_CHUNK):
-                sl = slice(s, s + _PAIR_CHUNK)
-                values = _direct_entries(p, c, pairs, ctx.gam_table, ctx.alpha, sl)
-                dp, dc = torch.autograd.grad((values * g[sl]).sum(), (p, c))
-                grad_pos += dp
-                grad_cell += dc
-        return grad_pos, grad_cell, None, None, None
+        g = pairs.weight * torch.where(off, g + grad_a[pairs.j, pairs.i], g)
+        fn = _maybe_compiled(_direct_sum_grad, ctx.compile)
+        grad_vec, grad_block = [], torch.zeros_like(block)
+        for s in range(0, vec.shape[0], _PAIR_CHUNK):
+            sl = slice(s, s + _PAIR_CHUNK)
+            dv, db = fn(vec[sl], block, gam[sl], alpha, g[sl])
+            grad_vec.append(dv)
+            grad_block = grad_block + db
+        dvec = torch.cat(grad_vec)
+        # vec = x_j - x_i + shift @ cell, block = ints @ cell
+        grad_pos = torch.zeros((ctx.n, 3), dtype=dvec.dtype, device=dvec.device)
+        grad_pos = grad_pos.index_add(0, pairs.j, dvec).index_add(0, pairs.i, -dvec)
+        ints = _direct_block(block.device, block.dtype)
+        grad_cell = pairs.shift.T @ dvec + ints.T @ grad_block
+        return grad_pos, grad_cell, None, None, None, None
 
 
 def _reciprocal_vectors(cell: Tensor) -> Tensor:
@@ -266,12 +299,12 @@ def _reciprocal_vectors(cell: Tensor) -> Tensor:
     return ints @ (2.0 * torch.pi * torch.linalg.inv(cell).mT)
 
 
-def coulomb_matrix_periodic(
-    pos: Tensor, cell: Tensor, rad: Tensor, eta: Tensor, alpha: float, pairs: ImagePairs
+def coulomb_matrix_reciprocal(
+    pos: Tensor, cell: Tensor, rad: Tensor, eta: Tensor, alpha: Tensor
 ) -> Tensor:
-    """(n, n) EEQ Coulomb matrix of a 3D cell; differentiable in ``pos`` and ``cell``."""
-    gam_table = 1.0 / torch.sqrt(rad[:, None].square() + rad[None, :].square())
-    a_dir = _DirectCoulomb.apply(pos, cell, pairs, gam_table, alpha)
+    """(n, n) reciprocal-space part plus the diagonal of the periodic EEQ Coulomb matrix (the
+    direct part is ``_DirectCoulomb``); ``alpha`` a 0-d tensor. Differentiable in ``pos`` and
+    ``cell``, and free of host syncs (it is part of the compiled graph stage)."""
     g = _reciprocal_vectors(cell)
     g2 = g.square().sum(-1)
     volume = torch.linalg.det(cell).abs()
@@ -280,7 +313,30 @@ def coulomb_matrix_periodic(
     cos, sin = torch.cos(phase), torch.sin(phase)
     a_rec = (cos * f) @ cos.T + (sin * f) @ sin.T
     diag = eta + _SQRT2PI / rad - 2.0 * alpha / math.sqrt(math.pi)
-    return a_dir + a_rec + torch.diag(diag)
+    return a_rec + torch.diag(diag)
+
+
+def direct_coulomb(
+    pos: Tensor, cell: Tensor, rad: Tensor, alpha: Tensor, pairs: ImagePairs, compile: bool
+) -> Tensor:
+    """(n, n) direct-space part of the periodic EEQ Coulomb matrix (``_DirectCoulomb``)."""
+    gam_table = 1.0 / torch.sqrt(rad[:, None].square() + rad[None, :].square())
+    return _DirectCoulomb.apply(pos, cell, pairs, gam_table, alpha, compile)
+
+
+def coulomb_matrix_periodic(
+    pos: Tensor,
+    cell: Tensor,
+    rad: Tensor,
+    eta: Tensor,
+    alpha: float,
+    pairs: ImagePairs,
+    compile: bool = False,
+) -> Tensor:
+    """(n, n) EEQ Coulomb matrix of a 3D cell; differentiable in ``pos`` and ``cell``."""
+    alpha_t = torch.tensor(alpha, dtype=pos.dtype, device=pos.device)
+    a_dir = direct_coulomb(pos, cell, rad, alpha_t, pairs, compile)
+    return a_dir + coulomb_matrix_reciprocal(pos, cell, rad, eta, alpha_t)
 
 
 def coulomb_matrix_molecular(pos: Tensor, rad: Tensor, eta: Tensor) -> Tensor:
@@ -293,11 +349,11 @@ def coulomb_matrix_molecular(pos: Tensor, rad: Tensor, eta: Tensor) -> Tensor:
     return a + torch.diag(eta + _SQRT2PI / rad)
 
 
-def solve_charges(a: Tensor, x: Tensor, total_charge: float) -> Tensor:
-    """q from the bordered system [A 1; 1^T 0] [q; lambda] = [x; Q]."""
+def solve_charges(a: Tensor, x: Tensor, total_charge: float | Tensor) -> Tensor:
+    """q from the bordered system [A 1; 1^T 0] [q; lambda] = [x; Q] (Q a float or 0-d tensor)."""
     n = a.shape[0]
     ones = a.new_ones(n, 1)
     top = torch.cat([a, ones], 1)
     bottom = torch.cat([ones.T, a.new_zeros(1, 1)], 1)
-    rhs = torch.cat([x, x.new_full((1,), total_charge)])
+    rhs = torch.cat([x, torch.as_tensor(total_charge, dtype=x.dtype, device=x.device).reshape(1)])
     return torch.linalg.solve(torch.cat([top, bottom], 0), rhs)[:n]
