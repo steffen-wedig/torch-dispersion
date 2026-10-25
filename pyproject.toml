@@ -12,6 +12,10 @@ dependencies = [
     "torch>=2.6",
 ]
 
+[project.optional-dependencies]
+# the batched TorchSim model (torch_dispersion.torchsim); the core install does not need it
+torchsim = ["torch-sim-atomistic>=0.6.2"]
+
 [dependency-groups]
 dev = [
     "dftd3==1.6.0",
@@ -25,6 +29,10 @@ dev = [
     "tad-dftd4>=0.8.0",
     "tad-multicharge>=0.5.0",
 ]
+
+[tool.uv]
+# the dev group's tad-dftd4 pins numpy<2, which torch-sim forbids on Python 3.13+: lock 3.12 only
+environments = ["python_full_version < '3.13'"]
 
 [build-system]
 requires = ["hatchling"]
