@@ -7,9 +7,9 @@ to the FourierATM energy with the same separable C9."""
 
 import torch
 
-import torch_dispersion.kernel as kernel_module
+import torch_dispersion.atm.kernel as kernel_module
 from torch_dispersion.atm import atm_dispersion
-from torch_dispersion.fourier import separable_c9
+from torch_dispersion.atm.fourier import separable_c9
 from torch_dispersion.settings import ATMSettings, FourierATMSettings
 
 

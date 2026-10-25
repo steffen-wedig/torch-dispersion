@@ -26,17 +26,11 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..atm import check_pbc
+from ..core.inputs import check_numbers, check_pbc, to_bohr
 from ..neighbors import NeighborMatrix, build_batched, make_builder
 from ..settings import D4Settings
 from .data import d4_reference_data
-from .dispersion import (
-    D4Result,
-    check_numbers,
-    evaluate_system,
-    neighbor_list_cutoff,
-    to_bohr,
-)
+from .dispersion import D4Result, evaluate_system, neighbor_list_cutoff
 
 
 @dataclass
@@ -88,7 +82,7 @@ def d4_dispersion_batched(
         total = [float(q) for q in torch.as_tensor(charges).reshape(-1).tolist()]
         if len(total) != n_systems:
             raise ValueError(f"{len(total)} total charges for {n_systems} systems")
-    check_numbers(numbers, d4_reference_data(device, settings.torch_dtype))
+    check_numbers(numbers, d4_reference_data(device, settings.torch_dtype).max_number)
     pos = to_bohr(positions, settings)
     cells_b = cells_a = None
     if pbc and cells is not None:

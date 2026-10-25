@@ -1,10 +1,9 @@
 """Dispersion corrections in PyTorch: DFT-D4 (dftd4 4.3.0) and the D3 Axilrod-Teller-Muto
 three-body term (simple-dftd3 1.6.0), in real space and cutoff-free (FourierATM)."""
 
-from .ase_calculator import TorchATMCalculator, TorchD4Calculator
-from .atm import ATMResult, atm_dispersion
+from .atm import ATMResult, FourierATMResult, atm_dispersion, fourier_atm
+from .calculators import TorchATMCalculator, TorchD4Calculator
 from .d4 import D4BatchResult, D4Result, d4_dispersion, d4_dispersion_batched
-from .fourier import FourierATMResult, fourier_atm
 from .settings import (
     ATMSettings,
     BruteForceNeighbors,

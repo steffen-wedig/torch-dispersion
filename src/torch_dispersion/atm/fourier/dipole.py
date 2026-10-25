@@ -31,7 +31,7 @@ from itertools import product
 import torch
 from torch import Tensor
 
-from ..neighbors import NeighborMatrix
+from ...neighbors import NeighborMatrix
 
 
 def q_grid(n: tuple[int, int, int], device: torch.device) -> tuple[Tensor, Tensor]:

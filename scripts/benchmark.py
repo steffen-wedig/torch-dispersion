@@ -19,9 +19,9 @@ import numpy as np
 import torch
 from ase.io import read
 
-import torch_dispersion.atm as atm_module
+import torch_dispersion.atm.realspace as atm_module
 from torch_dispersion.atm import atm_dispersion
-from torch_dispersion.kernel import TileInputs
+from torch_dispersion.atm.kernel import TileInputs
 from torch_dispersion.settings import ATMSettings
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"

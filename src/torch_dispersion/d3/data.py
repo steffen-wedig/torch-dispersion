@@ -1,4 +1,4 @@
-"""D3 reference tables as tensors, cached per (device, dtype).
+"""D3 reference tables as tensors, cached per (device, dtype), and the padded per-atom tables.
 
 All lengths in bohr, C6 in Hartree bohr^6. The tables are exported by
 ``scripts/export_reference_data.py`` from tad-dftd3 and tad-mctc.
@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import Tensor
+
+from ..core.padding import pad_numbers
 
 _PATH = Path(__file__).with_name("reference_data.npz")
 
@@ -45,6 +47,28 @@ def reference_data(device: torch.device, dtype: torch.dtype) -> ReferenceData:
     )
 
 
-def check_numbers(numbers: Tensor, data: ReferenceData) -> None:
-    if numbers.numel() and (int(numbers.min()) < 1 or int(numbers.max()) > data.max_number):
-        raise ValueError(f"atomic numbers must be in 1..{data.max_number}")
+@dataclass
+class D3System:
+    """Atoms padded with dummies (Z = 0, at the origin, no references) to ``n_padded`` rows."""
+
+    n: int
+    numbers: Tensor  # (Np,)
+    rcov: Tensor  # (Np,)
+    ref_cn: Tensor  # (Np, R)
+    ref_mask: Tensor  # (Np, R)
+    species: Tensor  # (Np,)
+    c6_species: Tensor  # (S, S, R, R)
+
+
+def pad_system(numbers: Tensor, n_padded: int, data: ReferenceData) -> D3System:
+    z, unique, species = pad_numbers(numbers, n_padded)
+    ref_mask = torch.arange(MAX_REFERENCES, device=z.device) < data.n_ref[z][:, None]
+    return D3System(
+        n=numbers.shape[0],
+        numbers=z,
+        rcov=data.covalent_radius[z],
+        ref_cn=data.reference_cn[z],
+        ref_mask=ref_mask,
+        species=species,
+        c6_species=data.c6_ref[unique][:, unique],
+    )

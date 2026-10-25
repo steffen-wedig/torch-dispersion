@@ -11,8 +11,8 @@ import torch
 from conftest import DEVICES, make_settings, random_cell, run, structures
 from torch._dynamo.utils import counters
 
-import torch_dispersion.kernel as kernel
-from torch_dispersion.kernel import KernelParams, TileInputs
+import torch_dispersion.atm.kernel as kernel
+from torch_dispersion.atm.kernel import KernelParams, TileInputs
 
 SHORT = {"three_body_cutoff_bohr": 20.0, "coordination_cutoff_bohr": 20.0}
 

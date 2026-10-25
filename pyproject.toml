@@ -28,6 +28,7 @@ dev = [
     "dftd4==4.3.0",
     "tad-dftd4>=0.8.0",
     "tad-multicharge>=0.5.0",
+    "vulture>=2.16",
 ]
 
 [tool.uv]
@@ -58,3 +59,23 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM", "NPY"]
+
+[tool.vulture]
+# tests, scripts and examples count as users of the package code
+paths = ["src", "tests", "scripts", "examples"]
+min_confidence = 60
+ignore_decorators = ["@model_validator"]
+ignore_names = [
+    # framework hooks and attributes: pydantic, ASE, torch.autograd.Function / nn.Module,
+    # TorchSim ModelInterface, pytest
+    "model_config",
+    "implemented_properties",
+    "forward",
+    "_memory_scales_with",
+    "pytestmark",
+    "pytest_collection_modifyitems",
+    # public result fields that nothing in the repository reads
+    "rms_rel_error",
+    "short_range_energy",
+    "cp_max_rel_error",
+]

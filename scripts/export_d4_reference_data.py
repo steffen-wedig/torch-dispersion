@@ -3,7 +3,7 @@
 Sources (Apache-2.0): tad-dftd4 (reference CNs, charges, polarisabilities, Gaussian-weight
 counts, effective charges, chemical hardnesses, r4/r2 values), tad-multicharge (EEQ-2019
 parameters) and tad-mctc (Pauling electronegativities). The D3 covalent radii (4/3 scaled, bohr)
-are shared with the D3 tables (``reference_data.npz``). Elements Z = 0..103; row 0 is the
+are shared with the D3 tables (``d3/reference_data.npz``). Elements Z = 0..103; row 0 is the
 padding dummy without references.
 
 Precision: tad-multicharge stores the EEQ parameters and tad-dftd4 builds r4r2 in float32, so
@@ -101,7 +101,7 @@ def main() -> None:
     r4_over_r2 = _literal(tad_r4r2, "_r4_over_r2")
     r4r2 = torch.sqrt(0.5 * r4_over_r2 * torch.sqrt(torch.arange(len(r4_over_r2), dtype=f64)))
 
-    with np.load(ROOT / "reference_data.npz") as d3:
+    with np.load(ROOT / "d3" / "reference_data.npz") as d3:
         rcov = torch.from_numpy(d3["covalent_radius"])
     eeq = tad_multicharge.param.eeq2019
     tables = {

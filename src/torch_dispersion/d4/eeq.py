@@ -25,12 +25,12 @@ by autograd (``torch.linalg.solve``).
 
 import math
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
 
 import torch
 from torch import Tensor
 
-from ..coordination import CN_MIN_R2
+from ..core.coordination import coordination_number
 from .model import erf_count
 
 CN_CUTOFF = 25.0
@@ -47,11 +47,8 @@ def eeq_coordination_number(
 ) -> Tensor:
     """sum_m 0.5 (1 + erf(-7.5 (r_im - Rc) / Rc)) within 25 bohr, then the smooth cap
     log(1 + e^8) - log(1 + e^(8 - CN))."""
-    r2 = vectors.square().sum(-1)
-    valid = mask & (r2 <= CN_CUTOFF * CN_CUTOFF) & (r2 >= CN_MIN_R2)
-    r = torch.sqrt(torch.where(valid, r2, 1.0))
-    rc = rcov_centre[:, None] + rcov_neighbor
-    cn = torch.where(valid, erf_count(r, rc, KCN), 0.0).sum(-1)
+    count = partial(erf_count, kcn=KCN)
+    cn = coordination_number(vectors, mask, rcov_centre, rcov_neighbor, CN_CUTOFF, count)
     return math.log1p(math.exp(CN_MAX)) - torch.nn.functional.softplus(CN_MAX - cn)
 
 

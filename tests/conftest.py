@@ -213,7 +213,7 @@ def make_fourier_settings(device="cpu", compile=False, **overrides):
 
 
 def run_fourier(atoms: Atoms, settings, **kwargs):
-    from torch_dispersion.fourier import fourier_atm
+    from torch_dispersion.atm.fourier import fourier_atm
 
     pbc = bool(atoms.pbc.all())
     return fourier_atm(

@@ -23,6 +23,8 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
+from ..core.tiles import Accumulators, TileLayout
+
 
 @dataclass(frozen=True)
 class KernelParams:
@@ -65,6 +67,29 @@ class TileInputs(NamedTuple):
     diagonal: Tensor  # () bool: p == q, keep only n < m
 
 
+def triple_inputs(r0: Tensor):
+    """``make_inputs`` of ``core.tiles.run_tiles`` (order 2) for the tile pair (p, q) of a
+    block; ``r0`` is the (Z, Z) damping radius table."""
+    diagonal = {flag: torch.tensor(flag, device=r0.device) for flag in (True, False)}
+
+    def make(layout: TileLayout, kb: int, tiles: tuple[int, ...]) -> TileInputs:
+        p, q = tiles
+        return TileInputs(
+            centre=layout.centres[kb],
+            idx_n=layout.indices[kb, p],
+            idx_m=layout.indices[kb, q],
+            mask_n=layout.mask[kb, p],
+            mask_m=layout.mask[kb, q],
+            z_centre=layout.z_centres[kb],
+            z_n=layout.z[kb, p],
+            z_m=layout.z[kb, q],
+            r0=r0,
+            diagonal=diagonal[p == q],
+        )
+
+    return make
+
+
 def _switch(r2: Tensor, cutoff: Tensor, width: Tensor) -> tuple[Tensor, Tensor]:
     """Quintic switch s(r) = x^3 (10 - 15 x + 6 x^2), x = (cutoff - r) / width, and ds/d(r^2).
 
@@ -97,9 +122,7 @@ class _Terms(NamedTuple):
     inv_r3: Tensor  # 1 / (r_ij r_ik r_jk)^3
     inv_r5: Tensor
     sw: tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor], tuple[Tensor, Tensor]]
-    inv_c6_ij: Tensor  # (B, T), 0 where C6 is below eps
-    inv_c6_ik: Tensor  # (B, T)
-    inv_c6_jk: Tensor
+    inv_c6_jk: Tensor  # 1 / C6_jk, 0 where C6 is below eps
     e: Tensor  # triangle energy including the 1/3, 0 where invalid
 
 
@@ -175,8 +198,6 @@ def _terms(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
         inv_r3=inv_r3,
         inv_r5=inv_r5,
         sw=sw,
-        inv_c6_ij=inv_c6[centre, t.idx_n],
-        inv_c6_ik=inv_c6[centre, t.idx_m],
         inv_c6_jk=inv_c6[jk],
         e=e,
     )
@@ -283,25 +304,6 @@ def tile_energy_and_grad_analytic(
 
 
 GRADIENTS = {"analytic": tile_energy_and_grad_analytic, "vjp": tile_energy_and_grad_vjp}
-
-
-class Accumulators(NamedTuple):
-    """Running sums of the triple stage, float64. Rows of the padded system (Np)."""
-
-    energy: Tensor  # ()
-    grad_pos: Tensor  # (Np, 3) explicit dE/dR
-    virial: Tensor  # (3, 3) explicit sum_r r (x) dE/dr
-    grad_c6: Tensor  # (Np, Np) dE/dC6
-
-
-def zero_accumulators(n_padded: int, device: torch.device) -> Accumulators:
-    f64 = torch.float64
-    return Accumulators(
-        energy=torch.zeros((), dtype=f64, device=device),
-        grad_pos=torch.zeros((n_padded, 3), dtype=f64, device=device),
-        virial=torch.zeros((3, 3), dtype=f64, device=device),
-        grad_c6=torch.zeros((n_padded, n_padded), dtype=f64, device=device),
-    )
 
 
 def _accumulate(

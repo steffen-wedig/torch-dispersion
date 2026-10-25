@@ -19,7 +19,7 @@ from functools import cache
 import torch
 from torch import Tensor
 
-from ..data import MAX_REFERENCES, reference_data
+from ...d3.data import MAX_REFERENCES, reference_data
 
 
 @dataclass(frozen=True)
@@ -106,10 +106,3 @@ def fit_c9(
     for row, (z, a) in enumerate(refs):
         factors[z, a] = v[row]
     return CPFit(numbers, factors, mu, err, rms)
-
-
-def atom_factors(weights: Tensor, numbers: Tensor, fit: CPFit) -> Tensor:
-    """a_ir = sum_p w_ip V_(Z_i, p) r. weights (N, 7), numbers (N,) (0 for dummies, whose
-    weights are zero). Returns (N, R) in the dtype and device of ``weights``."""
-    table = fit.factors.to(device=weights.device, dtype=weights.dtype)
-    return torch.einsum("ip,ipr->ir", weights, table[numbers])

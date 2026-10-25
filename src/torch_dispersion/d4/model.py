@@ -4,11 +4,12 @@ All functions are fixed-shape and branch-free, so they compile with ``fullgraph=
 """
 
 import math
+from functools import partial
 
 import torch
 from torch import Tensor
 
-from ..coordination import CN_MIN_R2
+from ..core.coordination import coordination_number
 
 KCN = 7.5
 # electronegativity scaling of the D4 CN: k4 exp(-(|EN_i - EN_j| + k5)^2 / k6)
@@ -36,12 +37,10 @@ def d4_coordination_number(
 
     vectors (N, M, 3) bohr, mask (N, M), centre tables (N,), neighbour tables (N, M).
     """
-    r2 = vectors.square().sum(-1)
-    valid = mask & (r2 <= cutoff * cutoff) & (r2 >= CN_MIN_R2)
-    r = torch.sqrt(torch.where(valid, r2, 1.0))
-    rc = rcov_centre[:, None] + rcov_neighbor
     den = K4 * torch.exp(-((en_centre[:, None] - en_neighbor).abs() + K5).square() / K6)
-    return torch.where(valid, den * erf_count(r, rc, KCN), 0.0).sum(-1)
+    return coordination_number(
+        vectors, mask, rcov_centre, rcov_neighbor, cutoff, partial(erf_count, kcn=KCN), den
+    )
 
 
 def zeta(gi: Tensor, qref: Tensor, qmod: Tensor) -> Tensor:

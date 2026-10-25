@@ -4,7 +4,7 @@ import hashlib
 
 import torch
 
-from torch_dispersion.data import _raw, reference_data
+from torch_dispersion.d3.data import _raw, reference_data
 
 # update together with scripts/export_reference_data.py
 CHECKSUM = "bbbcae3ff145c6ddd574eac17cc9fa97"

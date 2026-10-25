@@ -23,9 +23,9 @@ import torch
 import torch_sim as ts
 from ase.io import read
 
+from torch_dispersion.calculators.torchsim import D4Model
 from torch_dispersion.d4 import d4_dispersion
 from torch_dispersion.settings import BruteForceNeighbors, D4Settings, NvalchemiNeighbors
-from torch_dispersion.torchsim import D4Model
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 # r2SCAN-D4
