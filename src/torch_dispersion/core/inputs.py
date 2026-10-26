@@ -24,8 +24,7 @@ def check_numbers(numbers: Tensor, max_number: int) -> None:
 
 
 def check_coincident(nl: NeighborMatrix, positions: Tensor, cell: Tensor | None) -> None:
-    r2 = nl.vectors(positions, cell).square().sum(-1)
-    if bool((nl.mask & (r2 < CN_MIN_R2)).any()):
+    if nl.any_closer(positions, cell, CN_MIN_R2):
         raise ValueError("coincident atoms (or periodic images) found")
 
 

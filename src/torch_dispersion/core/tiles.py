@@ -11,7 +11,7 @@ compiled graph serves every system.
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from itertools import combinations_with_replacement
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 from torch import Tensor
@@ -98,16 +98,6 @@ class TileLayout:
     vectors: Tensor  # (blocks, tiles, B, T, 3) bohr
     counts: list[int]  # per block, the longest neighbour list
 
-    def tiled(self, x: Tensor) -> Tensor:
-        """Any further per-entry table (Np, M, ...) in the same tiled layout."""
-        n_blocks, n_tiles = self.indices.shape[:2]
-        x = x.reshape(n_blocks, self.block, n_tiles, self.tile, *x.shape[2:])
-        return x.transpose(1, 2).contiguous()
-
-    def rows(self, x: Tensor) -> Tensor:
-        """Any further per-row table (Np, ...) by centre block, (blocks, B, ...)."""
-        return x.reshape(-1, self.block, *x.shape[1:])
-
     @classmethod
     def build(
         cls, nl: NeighborMatrix, vectors: Tensor, numbers: Tensor, block: int, tile: int
@@ -137,22 +127,56 @@ class TileLayout:
         )
 
 
+@dataclass
+class SliceLayout:
+    """Tiles cut from an untiled neighbour matrix only when they are used, for long lists (the
+    60 bohr two-body list of a whole batch): no tiled copies and no displacement vectors of the
+    whole list; the kernel builds each tile's vectors from positions, indices and shifts. Each
+    tile is a (B, T) copy, padded where the rows or the width run out."""
+
+    block: int
+    tile: int
+    nl: NeighborMatrix  # (N, M), any width; rows beyond N are empty
+    centres: Tensor  # (blocks, B) atom index of the centres
+    counts: list[int]  # per block, the longest neighbour list
+    vectors = None  # the kernel computes its own
+
+    @classmethod
+    def build(cls, nl: NeighborMatrix, n_padded: int, block: int, tile: int) -> "SliceLayout":
+        """``nl`` with N rows (any width) for a system padded to ``n_padded`` rows."""
+        count = torch.nn.functional.pad(nl.count, (0, n_padded - nl.n_atoms))
+        counts = count.reshape(-1, block).amax(1).cpu().tolist()
+        centres = torch.arange(n_padded, device=nl.indices.device).reshape(-1, block)
+        return cls(block, tile, nl, centres, [int(c) for c in counts])
+
+    def entries(self, x: Tensor, kb: int, p: int, fill: float | bool) -> Tensor:
+        """Tile p of centre block kb of a per-entry table (N, M, ...) as a (B, T, ...) copy."""
+        r0, c0 = kb * self.block, p * self.tile
+        part = x[r0 : r0 + self.block, c0 : c0 + self.tile]
+        dr, dc = self.block - part.shape[0], self.tile - part.shape[1]
+        if dr or dc:
+            pad = (0, 0) * (x.dim() - 2) + (0, dc, 0, dr)
+            return torch.nn.functional.pad(part, pad, value=fill)
+        return part.contiguous()
+
+
 def run_tiles(
     step,
     acc,
     tables: Sequence[Tensor],
-    layout: TileLayout,
+    layout,
     n: int,
     order: int,
-    make_inputs: Callable[[TileLayout, int, tuple[int, ...]], tuple],
+    make_inputs: Callable[[Any, int, tuple[int, ...]], tuple],
     scalars,
 ):
     """``acc = step(acc, *vectors, *tables, inputs, scalars)`` for every tile set of the blocks
     holding the n real atoms: single tiles (p,) for ``order`` 1, tile pairs (p, q), q >= p, for
-    ``order`` 2, with ``vectors`` the displacement tiles of the set and ``inputs =
-    make_inputs(layout, block, tiles)``. ``tables`` are the system-sized per-atom inputs (C6
-    first, (Np, Np) or flat, then (Np, ...) tables); their system-sized dimensions are marked
-    dynamic (a no-op without compilation)."""
+    ``order`` 2, with ``vectors`` the displacement tiles of the set (none for a
+    ``SliceLayout``, whose kernel builds them) and ``inputs = make_inputs(layout, block,
+    tiles)``. ``layout`` is a ``TileLayout`` or a ``SliceLayout``. ``tables`` are the
+    system-sized per-atom inputs (C6 first, (Np, Np) or flat, then (Np, ...) tables); their
+    system-sized dimensions are marked dynamic (a no-op without compilation)."""
     for i, x in enumerate(tables):
         for d in range(x.dim()) if i == 0 else (0,):
             torch._dynamo.mark_dynamic(x, d)
@@ -163,6 +187,6 @@ def run_tiles(
             inputs = make_inputs(layout, kb, tiles)
             if track:
                 mark_system_sized(acc)
-            vectors = [layout.vectors[kb, p] for p in tiles]
+            vectors = [] if layout.vectors is None else [layout.vectors[kb, p] for p in tiles]
             acc = step(acc, *vectors, *tables, inputs, scalars)
     return acc

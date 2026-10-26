@@ -14,10 +14,13 @@ class NeighborMatrix:
     Excludes (i, i, T = 0), includes the self-images (i, i, T != 0). The displacement of entry
     (i, m) is ``pos[indices[i, m]] - pos[i] + shifts[i, m] @ cell``. Indices and shifts carry no
     gradient; displacements are always recomputed from the caller's positions and cell.
+
+    Long lists (tens of thousands of entries per row at 60 bohr) are stored compactly: int32
+    indices and int8 shifts (int16 beyond +-127), 8 bytes per entry; see ``compact``.
     """
 
-    indices: Tensor  # (N, M) int64, padded with N
-    shifts: Tensor  # (N, M, 3) int64 lattice shifts, 0 in padding
+    indices: Tensor  # (N, M) int32, padded with N
+    shifts: Tensor  # (N, M, 3) int8 (or int16) lattice shifts, 0 in padding
     mask: Tensor  # (N, M) bool
     count: Tensor  # (N,) int64
 
@@ -46,25 +49,72 @@ class NeighborMatrix:
             vec = vec + self.shifts.to(positions.dtype) @ cell  # (N, M, 3) @ (3, 3) or (N, 3, 3)
         return torch.where(self.mask[..., None], vec, 0.0)
 
+    def row_chunks(self) -> list[slice]:
+        """Row ranges of at most ~2^22 entries: per-entry temporaries of a long list (vectors,
+        distances, sort keys) are built one chunk at a time."""
+        rows = max(1, (1 << 22) // max(self.width, 1))
+        return [slice(r, r + rows) for r in range(0, self.n_atoms, rows)]
+
+    def _r2(self, positions: Tensor, cell: Tensor | None, rows: slice) -> Tensor:
+        """Squared lengths (rows, M) of the displacements of ``rows`` (0 in padding)."""
+        part = NeighborMatrix(
+            indices=self.indices[rows],
+            shifts=self.shifts[rows],
+            mask=self.mask[rows],
+            count=self.count[rows],
+        )
+        # positions of the neighbours via the full array, of the centres via the row range
+        extended = torch.cat([positions, positions.new_zeros(1, 3)])
+        vec = extended.index_select(0, part.indices.reshape(-1)).view(*part.indices.shape, 3)
+        vec = vec - positions[rows][:, None, :]
+        if cell is not None:
+            vec = vec + part.shifts.to(positions.dtype) @ (cell[rows] if cell.dim() == 3 else cell)
+        return torch.where(part.mask, vec.square().sum(-1), 0.0)
+
+    def within(self, positions: Tensor, cell: Tensor | None, cutoff: float) -> Tensor:
+        """(N, M) bool: real entries with r^2 <= cutoff^2, computed in row chunks."""
+        with torch.no_grad():
+            positions = positions.detach()
+            cell = None if cell is None else cell.detach()
+            parts = [
+                self.mask[rows] & (self._r2(positions, cell, rows) <= cutoff * cutoff)
+                for rows in self.row_chunks()
+            ]
+        return torch.cat(parts) if parts else self.mask.clone()
+
+    def any_closer(self, positions: Tensor, cell: Tensor | None, r2_min: float) -> bool:
+        """Whether a real entry has r^2 < ``r2_min`` (row chunks, one host sync)."""
+        with torch.no_grad():
+            positions = positions.detach()
+            cell = None if cell is None else cell.detach()
+            hits = [
+                (self.mask[rows] & (self._r2(positions, cell, rows) < r2_min)).any()
+                for rows in self.row_chunks()
+            ]
+        return bool(torch.stack(hits).any()) if hits else False
+
     def restrict(self, positions: Tensor, cell: Tensor | None, cutoff: float) -> "NeighborMatrix":
         """Keep entries with r^2 <= cutoff^2 and compact the rows."""
-        with torch.no_grad():
-            r2 = self.vectors(positions.detach(), None if cell is None else cell.detach())
-            r2 = r2.square().sum(-1)
-            keep = self.mask & (r2 <= cutoff * cutoff)
-        return self.select(keep)
+        return self.select(self.within(positions, cell, cutoff))
 
     def select(self, keep: Tensor) -> "NeighborMatrix":
-        """Compact the rows to the entries where ``keep`` is True (order preserved)."""
+        """Compact the rows to the entries where ``keep`` is True (order preserved; row
+        chunks)."""
         n = self.n_atoms
         count = keep.sum(-1)
         width = int(count.max()) if n else 0
-        # stable sort moves the kept entries to the front of each row, in their original order
-        order = torch.sort((~keep).to(torch.int8), dim=-1, stable=True).indices[:, :width]
-        mask = torch.gather(keep, 1, order)
-        indices = torch.where(mask, torch.gather(self.indices, 1, order), n)
-        shifts = torch.gather(self.shifts, 1, order[..., None].expand(-1, -1, 3))
-        shifts = torch.where(mask[..., None], shifts, 0)
+        parts = []
+        for rows in self.row_chunks():
+            k = keep[rows]
+            # stable sort moves the kept entries to the front of each row, in their order
+            order = torch.sort((~k).to(torch.int8), dim=-1, stable=True).indices[:, :width]
+            mask = torch.gather(k, 1, order)
+            indices = torch.where(mask, torch.gather(self.indices[rows], 1, order), n)
+            shifts = torch.gather(self.shifts[rows], 1, order[..., None].expand(-1, -1, 3))
+            parts.append((indices, torch.where(mask[..., None], shifts, 0), mask))
+        if not parts:
+            return self
+        indices, shifts, mask = (torch.cat(x) for x in zip(*parts, strict=True))
         return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)
 
     def pad(self, n_rows: int, width_multiple: int) -> "NeighborMatrix":
@@ -131,13 +181,20 @@ def from_pairs(i: Tensor, j: Tensor, shifts: Tensor, n_atoms: int) -> NeighborMa
     width = int(count.max()) if i.numel() else 0
     offsets = torch.cumsum(count, 0) - count
     col = torch.arange(i.numel(), device=i.device) - offsets[i]
-    indices = torch.full((n_atoms, width), n_atoms, dtype=torch.int64, device=i.device)
-    out_shifts = torch.zeros((n_atoms, width, 3), dtype=torch.int64, device=i.device)
+    indices = torch.full((n_atoms, width), n_atoms, dtype=torch.int32, device=i.device)
+    out_shifts = torch.zeros((n_atoms, width, 3), dtype=shift_dtype(shifts), device=i.device)
     mask = torch.zeros((n_atoms, width), dtype=torch.bool, device=i.device)
-    indices[i, col] = j.to(torch.int64)
-    out_shifts[i, col] = shifts.to(torch.int64)
+    indices[i, col] = j.to(torch.int32)
+    out_shifts[i, col] = shifts.to(out_shifts.dtype)
     mask[i, col] = True
     return NeighborMatrix(indices=indices, shifts=out_shifts, mask=mask, count=count)
+
+
+def shift_dtype(shifts: Tensor) -> torch.dtype:
+    """int8 if every lattice shift fits (one host sync), else int16."""
+    if shifts.numel() and int(shifts.abs().max()) > 127:
+        return torch.int16
+    return torch.int8
 
 
 class NeighborBuilder(Protocol):

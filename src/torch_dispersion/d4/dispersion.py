@@ -31,7 +31,13 @@ from ..core.batch import Batch, pad_to_systems
 from ..core.chain import Strained, close_chain, forces_and_stress, graph_fn, strained
 from ..core.inputs import check_coincident, check_numbers, check_pbc, to_bohr
 from ..core.padding import CN_WIDTH_MULTIPLE, pad_numbers, pad_positions, padded_size
-from ..core.tiles import Accumulators, TileLayout, run_tiles, zero_energy_or_accumulators
+from ..core.tiles import (
+    Accumulators,
+    SliceLayout,
+    TileLayout,
+    run_tiles,
+    zero_energy_or_accumulators,
+)
 from ..neighbors import NeighborMatrix, build_flat
 from ..pairwise.rational import get_pair_step_fn, pair_inputs, pair_scalars, rational_tables
 from ..settings import D4Settings
@@ -542,22 +548,21 @@ def _two_body(
     n_max): energy (S,) or ``Accumulators`` (per-system energy and virial, dE/dC6 flat)."""
     device, dtype = settings.torch_device, settings.torch_dtype
     n_padded = tables.numbers.shape[0]
-    block, tile = settings.centre_block_size, settings.pair_tile_size
     cutoff = settings.two_body_cutoff_bohr
-    nl = restricted(cutoff).pad(n_padded, tile)
-    layout = TileLayout.build(nl, nl.vectors(pos_d, rows_d), tables.numbers, block, tile)
-    n_max = batch.n_max
-    c6_index = (system_rows * n_max + local_rows)[:, None] * n_max + local_rows[nl.indices]
+    # the list as built (no padded or tiled copy); the kernel makes each tile's vectors
+    nl = restricted(cutoff)
+    layout = SliceLayout.build(nl, n_padded, settings.centre_block_size, settings.pair_tile_size)
+    cells = rows_d if rows_d is not None else pos_d.new_zeros(n_padded, 3, 3)
     rr, r0 = rational_tables(data.r4r2, settings.a1, settings.a2)
     return run_tiles(
         get_pair_step_fn(need_grad, settings.compile),
         zero_energy_or_accumulators(need_grad, n_padded, device, batch.n_systems, c6.numel()),
-        (c6.reshape(-1),),
+        (c6.reshape(-1), pos_d, cells, tables.numbers, local_rows),
         layout,
         batch.n_atoms,
         1,
-        pair_inputs(rr, r0, layout.tiled(c6_index), layout.rows(system_rows)),
-        pair_scalars(settings.s6, settings.s8, cutoff, dtype, device),
+        pair_inputs(rr, r0, system_rows),
+        pair_scalars(settings.s6, settings.s8, cutoff, batch.n_max, dtype, device),
     )
 
 

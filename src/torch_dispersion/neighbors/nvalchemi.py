@@ -10,7 +10,7 @@ import math
 import torch
 from torch import Tensor
 
-from .base import NeighborMatrix
+from .base import NeighborMatrix, shift_dtype
 
 HEADROOM = 1.3
 MIN_EXTRA = 32
@@ -109,9 +109,10 @@ def _to_matrix(
     padded with the local atom count."""
     n = matrix.shape[0]
     mask = torch.arange(width, device=matrix.device)[None, :] < count[:, None]
-    indices = torch.where(mask, matrix[:, :width].to(torch.int64) - offset, n)
+    indices = torch.where(mask, matrix[:, :width].to(torch.int32) - offset, n)
     if shifts is not None:
-        shifts = torch.where(mask[..., None], shifts[:, :width].to(torch.int64), 0)
+        shifts = shifts[:, :width]
+        shifts = torch.where(mask[..., None], shifts.to(shift_dtype(shifts)), 0)
     else:
-        shifts = torch.zeros((n, width, 3), dtype=torch.int64, device=matrix.device)
+        shifts = torch.zeros((n, width, 3), dtype=torch.int8, device=matrix.device)
     return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)

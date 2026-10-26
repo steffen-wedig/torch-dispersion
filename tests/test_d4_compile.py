@@ -27,52 +27,56 @@ def unique_graphs() -> int:
 
 
 def dummy_tile(device, block=4, tile=16, n=9, box=30.0, cutoff=20.0):
-    """Pair tile of ``block`` centres over random neighbours in a ``box`` bohr cube (no PBC);
-    some pairs lie beyond the cutoff, and padded entries are masked."""
+    """Pair tile of ``block`` centres over random neighbours and lattice shifts (-1, 0, 1) of a
+    ``box`` bohr cubic cell; some pairs lie beyond the cutoff, and padded entries are masked.
+    Returns the kernel's per-atom tables (one system), the tile inputs and the scalars."""
     g = torch.Generator().manual_seed(0)
     f64 = torch.float64
     pos = (torch.rand(n, 3, generator=g, dtype=f64) * box).to(device)
+    cell = torch.eye(3, dtype=f64, device=device) * box
     numbers = torch.tensor([1, 6, 8, 7, 1, 6, 8, 16, 35])[:n].to(device)
     centre = torch.arange(block, device=device)
     idx = torch.randint(0, n, (block, tile), generator=g).to(device)
-    mask = (torch.rand(block, tile, generator=g) > 0.2).to(device) & (idx != centre[:, None])
+    shift = torch.randint(-1, 2, (block, tile, 3), generator=g).to(device, torch.int8)
+    self_image = (idx == centre[:, None]) & (shift == 0).all(-1)
+    mask = (torch.rand(block, tile, generator=g) > 0.2).to(device) & ~self_image
     r4r2 = d4_reference_data(torch.device(device), f64).r4r2
     rr = 3.0 * r4r2[:, None] * r4r2[None, :]
     inputs = rational.PairTileInputs(
         centre=centre,
         idx=idx,
+        shift=shift,
         mask=mask,
-        z_centre=numbers[centre],
-        z=numbers[idx],
-        c6_index=centre[:, None] * n + idx,  # one system: C6 (n, n) flattened
         system=torch.zeros_like(centre),
         rr=rr,
         r0=0.5 * torch.sqrt(rr) + 5.7,
     )
     c6 = (torch.rand(n, n, generator=g, dtype=f64) * 30 + 1).to(device)
     c6 = 0.5 * (c6 + c6.T)
-    scalars = rational.pair_scalars(1.0, 0.6, cutoff, f64, torch.device(device))
-    return pos, c6.reshape(-1), inputs, scalars
+    local = torch.arange(n, device=device)
+    scalars = rational.pair_scalars(1.0, 0.6, cutoff, n, f64, torch.device(device))
+    return (pos, cell, numbers, local), c6.reshape(-1), inputs, scalars
 
 
-def vectors(pos, t):
-    return torch.where(t.mask[..., None], pos[t.idx] - pos[t.centre][:, None, :], 0.0)
+def tables(pos, cell, numbers, local):
+    return pos, cell.expand(pos.shape[0], 3, 3), numbers, local
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("with_grad", [False, True])
 def test_pair_kernel_fullgraph(with_grad, device):
     """fullgraph=True compiles (a graph break would raise) and matches eager."""
-    pos, c6, t, s = dummy_tile(device)
-    v = vectors(pos, t)
+    atoms, c6, t, s = dummy_tile(device)
+    n = atoms[0].shape[0]
 
     def zero():
         if with_grad:
-            return zero_accumulators(pos.shape[0], torch.device(device), 1, c6.numel())
+            return zero_accumulators(n, torch.device(device), 1, c6.numel())
         return torch.zeros(1, dtype=torch.float64, device=device)
 
-    compiled = rational.get_pair_step_fn(with_grad, compile=True)(zero(), v, c6, t, s)
-    eager = rational.get_pair_step_fn(with_grad, compile=False)(zero(), v, c6, t, s)
+    args = (c6, *tables(*atoms), t, s)
+    compiled = rational.get_pair_step_fn(with_grad, compile=True)(zero(), *args)
+    eager = rational.get_pair_step_fn(with_grad, compile=False)(zero(), *args)
     compiled = compiled if with_grad else [compiled]
     eager = eager if with_grad else [eager]
     assert float(eager[0]) != 0.0
@@ -83,23 +87,25 @@ def test_pair_kernel_fullgraph(with_grad, device):
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("compile", [False, True])
 def test_pair_gradients_match_autograd(compile, device):
-    """Hand-written energy, dE/dR, virial and dE/dC6 of the pair kernel equal autograd."""
-    pos, c6, t, s = dummy_tile(device)
+    """Hand-written energy, dE/dR, virial (dE/dε) and dE/dC6 of the pair kernel equal autograd
+    through the energy of strained positions and cell."""
+    (pos, cell, numbers, local), c6, t, s = dummy_tile(device)
     pos_leaf, c6_leaf = pos.clone().requires_grad_(), c6.clone().requires_grad_()
-    v = vectors(pos_leaf, t)
+    strain = torch.zeros(3, 3, dtype=pos.dtype, device=device, requires_grad=True)
+    deform = torch.eye(3, dtype=pos.dtype, device=device) + strain
+    atoms = tables(pos_leaf @ deform, cell @ deform, numbers, local)
     zero = torch.zeros(1, dtype=torch.float64, device=device)
-    energy = rational.energy_step(zero, v, c6_leaf, t, s)
-    grad_pos, grad_c6, grad_v = torch.autograd.grad(energy.sum(), (pos_leaf, c6_leaf, v))
-    virial = torch.einsum("btx,bty->xy", v.detach(), grad_v)[None]
+    energy = rational.energy_step(zero, c6_leaf, *atoms, t, s)
+    grad_pos, grad_c6, virial = torch.autograd.grad(energy.sum(), (pos_leaf, c6_leaf, strain))
 
     step = rational.get_pair_step_fn(True, compile)
     acc0 = zero_accumulators(pos.shape[0], torch.device(device), 1, c6.numel())
-    acc = step(acc0, v.detach(), c6, t, s)
+    acc = step(acc0, c6, *tables(pos, cell, numbers, local), t, s)
     assert bool(grad_pos.abs().sum() > 0) and bool(grad_c6.abs().sum() > 0)
     torch.testing.assert_close(acc.energy, energy.detach(), rtol=1e-14, atol=0)
     torch.testing.assert_close(acc.grad_pos, grad_pos, rtol=1e-12, atol=1e-20)
     torch.testing.assert_close(acc.grad_c6, grad_c6, rtol=1e-12, atol=1e-20)
-    torch.testing.assert_close(acc.virial, virial, rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(acc.virial, virial[None], rtol=1e-12, atol=1e-20)
 
 
 @pytest.mark.parametrize("device", DEVICES)
