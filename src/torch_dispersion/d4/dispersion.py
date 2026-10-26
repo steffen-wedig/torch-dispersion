@@ -114,30 +114,69 @@ def _c6_pair(
 
 
 def _charges(
-    numbers: Tensor,
+    cn_eeq: Tensor,
     pos: Tensor,
     cell: Tensor | None,
-    cell_ref: Tensor | None,
-    cn_eeq: Tensor,
-    data: D4ReferenceData,
-    total_charge: float,
+    a_dir: Tensor | None,
+    rad: Tensor,
+    eta: Tensor,
+    chi: Tensor,
+    kcnchi: Tensor,
+    alpha: Tensor,
+    total_charge: Tensor,
 ) -> Tensor:
-    """EEQ charges of the n real atoms (float64). ``cell_ref`` (unstrained, detached) fixes the
-    Wigner-Seitz images and the Ewald splitting."""
-    f64 = torch.float64
-    pos, cn_eeq = pos.to(f64), cn_eeq.to(f64)
-    rad, eta = data.eeq_rad.to(f64)[numbers], data.eeq_eta.to(f64)[numbers]
-    x = eeq.electronegativity_vector(
-        cn_eeq, data.eeq_chi.to(f64)[numbers], data.eeq_kcnchi.to(f64)[numbers]
-    )
+    """EEQ charges of the n real atoms, all inputs float64. With PBC, ``a_dir`` is the direct
+    Coulomb part (``eeq.direct_coulomb``) and ``alpha`` the Ewald splitting."""
+    x = eeq.electronegativity_vector(cn_eeq, chi, kcnchi)
     if cell is None:
         a = eeq.coulomb_matrix_molecular(pos, rad, eta)
     else:
-        assert cell_ref is not None
-        alpha = eeq.ewald_alpha(cell_ref)
-        pairs = eeq.wigner_seitz_images(pos.detach(), cell_ref.to(f64))
-        a = eeq.coulomb_matrix_periodic(pos, cell.to(f64), rad, eta, alpha, pairs)
+        assert a_dir is not None
+        a = a_dir + eeq.coulomb_matrix_reciprocal(pos, cell, rad, eta, alpha)
     return eeq.solve_charges(a, x, total_charge)
+
+
+def _graph(
+    vec_cn: Tensor,
+    mask_cn: Tensor,
+    idx_cn: Tensor,
+    vec_eeq: Tensor,
+    mask_eeq: Tensor,
+    idx_eeq: Tensor,
+    rcov: Tensor,
+    en: Tensor,
+    cutoff: float,
+    pos: Tensor,
+    cell: Tensor | None,
+    a_dir: Tensor | None,
+    eeq_tables: tuple[Tensor, Tensor, Tensor, Tensor],
+    alpha: Tensor,
+    total_charge: Tensor,
+    c6_tables: tuple[Tensor, ...],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """The graph stage after the host-side EEQ setup, as one function (compiled with dynamic
+    shapes, so its backward is one compiled graph too): CN and EEQ CN of the padded system ->
+    EEQ charges (n,) in float64 -> C6(q), C6(q = 0) (Np, Np).
+
+    ``eeq_tables`` are (rad, eta, chi, kcnchi) of the n real atoms in float64, ``c6_tables``
+    the ``_c6_pair`` tables after the charges."""
+    f64 = torch.float64
+    cn, cn_eeq = _coordination_numbers(
+        vec_cn, mask_cn, idx_cn, vec_eeq, mask_eeq, idx_eeq, rcov, en, cutoff
+    )
+    n = pos.shape[0]
+    q = _charges(
+        cn_eeq[:n].to(f64),
+        pos.to(f64),
+        None if cell is None else cell.to(f64),
+        a_dir,
+        *eeq_tables,
+        alpha,
+        total_charge,
+    )
+    q_p = torch.nn.functional.pad(q.to(cn.dtype), (0, cn.shape[0] - n))
+    c6_q, c6_0 = _c6_pair(cn, q_p, *c6_tables)
+    return q, c6_q, c6_0
 
 
 @dataclass(frozen=True)
@@ -313,7 +352,30 @@ def _graph_stage(
     nl_cn = restricted(ccn).pad(n_padded, CN_WIDTH_MULTIPLE)
     nl_eeq = restricted(eeq.CN_CUTOFF).pad(n_padded, CN_WIDTH_MULTIPLE)
     pos_p = pad_positions(pos_s, n_padded)
-    cn, cn_eeq = graph_fn(_coordination_numbers, settings.compile)(
+    f64 = torch.float64
+    z = system.numbers[:n]
+    rad = data.eeq_rad.to(f64)[z]
+    eeq_tables = (rad, data.eeq_eta.to(f64)[z], data.eeq_chi.to(f64)[z], data.eeq_kcnchi.to(f64)[z])
+    # host-side EEQ setup (depends on the unstrained cell only): splitting and image pairs, then
+    # the direct Coulomb sum, which has its own analytic backward
+    alpha = torch.zeros((), dtype=f64, device=pos_s.device)
+    a_dir = None
+    if cell_s is not None:
+        assert cell_b is not None
+        alpha = torch.tensor(eeq.ewald_alpha(cell_b), dtype=f64, device=pos_s.device)
+        pairs = eeq.wigner_seitz_images(pos_s.detach(), cell_b.to(f64))
+        pos64, cell64 = pos_s.to(f64), cell_s.to(f64)
+        a_dir = eeq.direct_coulomb(pos64, cell64, rad, alpha, pairs, settings.compile)
+    c6_tables = (
+        system.reference_cn,
+        system.reference_q,
+        system.n_gaussians,
+        system.zeff,
+        system.hardness,
+        system.species,
+        system.c6_species,
+    )
+    return graph_fn(_graph, settings.compile)(
         nl_cn.vectors(pos_p, cell_s),
         nl_cn.mask,
         nl_cn.indices,
@@ -323,21 +385,14 @@ def _graph_stage(
         system.rcov,
         system.en,
         ccn,
+        pos_s,
+        cell_s,
+        a_dir,
+        eeq_tables,
+        alpha,
+        torch.tensor(charge, dtype=f64, device=pos_s.device),
+        c6_tables,
     )
-    q = _charges(system.numbers[:n], pos_s, cell_s, cell_b, cn_eeq[:n], data, charge)
-    q_p = torch.nn.functional.pad(q.to(settings.torch_dtype), (0, n_padded - n))
-    c6_q, c6_0 = graph_fn(_c6_pair, settings.compile)(
-        cn,
-        q_p,
-        system.reference_cn,
-        system.reference_q,
-        system.n_gaussians,
-        system.zeff,
-        system.hardness,
-        system.species,
-        system.c6_species,
-    )
-    return q, c6_q, c6_0
 
 
 def _tile_stage(

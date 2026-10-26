@@ -87,13 +87,14 @@ def assert_matches_loop(out, atoms_list, settings, compute_charges: bool, exact:
     assert set(out) == set(expected)
     for key, value in expected.items():
         assert out[key].dtype == torch.float64
-        # the EEQ solve amplifies the rounding of a different neighbour order (batched vs
-        # single nvalchemiops lists on CUDA) to ~3e-13 e in the charges
-        assert_same(out[key], value, exact, atol=1e-12 if key == "charges" else 1e-13)
+        assert_same(out[key], value, exact, atol=1e-10 if key == "charges" else 1e-12)
 
 
-def assert_same(got, expected, exact: bool, atol: float = 1e-13):
-    """Bit for bit if ``exact`` on the CPU, else to rounding."""
+def assert_same(got, expected, exact: bool, atol: float = 1e-12):
+    """Bit for bit if ``exact`` on the CPU, else to rounding. On CUDA the EEQ Coulomb matrix is
+    assembled with atomic adds, so it rounds differently from run to run, and the charges
+    amplify that strongly: 1-ulp noise in the matrix of the 1024-atom box (condition number
+    ~200) moves them by ~3e-12 e and the forces by ~6e-14 eV/Å."""
     if exact and got.device.type == "cpu":
         assert torch.equal(got, expected), (got - expected).abs().max()
     else:

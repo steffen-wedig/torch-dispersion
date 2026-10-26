@@ -122,22 +122,25 @@ def test_properties_random_cells(seed):
     assert_properties(atoms)
 
 
-def test_eeq_direct_backward_matches_autograd():
-    """The recompute-in-backward direct Coulomb sum equals plain autograd through it."""
+@pytest.mark.parametrize("compile", [False, True])
+def test_eeq_direct_backward_matches_autograd(compile):
+    """The analytic backward of the direct Coulomb sum equals plain autograd through it."""
     data = d4_reference_data(torch.device("cpu"), torch.float64)
     atoms = random_cell(4, seed=2)
     z = torch.tensor(atoms.numbers)
     pos = (torch.tensor(atoms.positions) / BOHR).requires_grad_()
     cell = (torch.tensor(atoms.cell.array) / BOHR).requires_grad_()
     rad = data.eeq_rad[z]
-    alpha = eeq.ewald_alpha(cell)
+    alpha = torch.tensor(eeq.ewald_alpha(cell), dtype=torch.float64)
     pairs = eeq.wigner_seitz_images(pos, cell)
     gam = 1.0 / torch.sqrt(rad[:, None] ** 2 + rad[None, :] ** 2)
     weights = torch.randn(len(atoms), len(atoms), dtype=torch.float64)
-    a = eeq._DirectCoulomb.apply(pos, cell, pairs, gam, alpha)
-    values = eeq._direct_entries(pos, cell, pairs, gam, alpha, slice(None))
-    a_plain = eeq._scatter_symmetric(len(atoms), pairs, values)
-    torch.testing.assert_close(a, a_plain, rtol=0, atol=0)
+    a = eeq._DirectCoulomb.apply(pos, cell, pairs, gam, alpha, compile)
+    vec = pos[pairs.j] - pos[pairs.i] + pairs.shift @ cell
+    block = eeq._direct_block(cell.device, cell.dtype) @ cell
+    values = eeq._direct_sum(vec, block, gam[pairs.i, pairs.j], alpha)
+    a_plain = eeq._scatter_symmetric(len(atoms), pairs, pairs.weight * values)
+    torch.testing.assert_close(a, a_plain, rtol=1e-15, atol=0)
     got = torch.autograd.grad((a * weights).sum(), (pos, cell))
     ref = torch.autograd.grad((a_plain * weights).sum(), (pos, cell))
     for g, r in zip(got, ref, strict=True):
