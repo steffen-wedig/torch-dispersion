@@ -23,7 +23,7 @@ from conftest import (
 from torch_dispersion.atm.realspace import _stage1
 from torch_dispersion.core.inputs import prepare
 from torch_dispersion.core.padding import CN_WIDTH_MULTIPLE, pad_positions, padded_size
-from torch_dispersion.core.tiles import TileLayout, run_tiles
+from torch_dispersion.core.tiles import SliceLayout, run_tiles
 from torch_dispersion.d3.data import pad_system, reference_data
 from torch_dispersion.neighbors import make_builder
 from torch_dispersion.pairwise.rational import (
@@ -55,20 +55,22 @@ def two_body(atoms, settings) -> float:
     nl_cn = builder(pos, cell_b, pbc, ccn).pad(n_padded, CN_WIDTH_MULTIPLE)
     tables = (system.rcov, system.ref_cn, system.ref_mask, system.species, system.c6_species)
     _, c6 = _stage1(pos_p, cell_b, nl_cn, *tables, ccn)
-    nl = builder(pos, cell_b, pbc, CUTOFF).pad(n_padded, tile)
-    layout = TileLayout.build(nl, nl.vectors(pos_p, cell_b), system.numbers, block, tile)
+    nl = builder(pos, cell_b, pbc, CUTOFF)
     rr, r0 = rational_tables(data.r4r2, DAMPING["a1"], DAMPING["a2"])
+    rows = torch.zeros(n_padded, dtype=torch.int64, device=device)  # one system
+    local = torch.arange(n_padded, device=device)
+    cells = pos_p.new_zeros(n_padded, 3, 3) if cell_b is None else cell_b.expand(n_padded, 3, 3)
     energy = run_tiles(
         get_pair_step_fn(False, compile=False),
-        torch.zeros((), dtype=torch.float64, device=device),
-        (c6,),
-        layout,
+        torch.zeros(1, dtype=torch.float64, device=device),
+        (c6.reshape(-1), pos_p, cells, system.numbers, local),  # C6 (Np, Np) flattened
+        SliceLayout.build(nl, n_padded, block, tile),
         n,
         1,
-        pair_inputs(rr, r0),
-        pair_scalars(DAMPING["s6"], DAMPING["s8"], CUTOFF, dtype, device),
+        pair_inputs(rr, r0, rows),
+        pair_scalars(DAMPING["s6"], DAMPING["s8"], CUTOFF, n_padded, dtype, device),
     )
-    return float(energy)
+    return float(energy[0])
 
 
 @pytest.mark.parametrize("device", DEVICES)

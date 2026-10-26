@@ -1,10 +1,11 @@
-"""Per-stage time of the batched D4 model, to plan fused/Triton kernels.
+"""Per-stage time and peak memory of the batched D4 model, to plan fused/Triton kernels.
 
 Wraps the stage functions of ``d4_dispersion_batched`` with synchronising timers and reports,
-per batch and s9, the time in: the neighbour list, the coincidence check, the host-side EEQ
-setup and direct Coulomb sum, the compiled graph stage (CN, EEQ, C6), the two-body and ATM tile
-loops and the chain closure (the backward of the graph stage); plus the number of CUDA kernel
-launches of one batched call (torch.profiler).
+per batch and s9, the time in: the neighbour list and its restrictions, the coincidence check,
+the reference tables, the host-side EEQ setup and direct Coulomb sum, the compiled graph stage
+(CN, EEQ, C6), the two-body and ATM tile loops and the chain closure (the backward of the graph
+stage); the peak GPU memory of one call; and the number of CUDA kernel launches
+(torch.profiler).
 
     uv run python scripts/profile_d4_stages.py --device cuda
 """
@@ -19,11 +20,12 @@ from typing import Any
 
 import torch
 from ase.build import bulk
-from benchmark_torchsim import build_batch
+from ase.io import read
+from benchmark_torchsim import FIXTURES, build_batch
 
-import torch_dispersion.d4.batched as batched_module
 import torch_dispersion.d4.dispersion as d4_module
 from torch_dispersion.d4 import d4_dispersion_batched
+from torch_dispersion.neighbors import NeighborMatrix
 from torch_dispersion.settings import D4Settings, NvalchemiNeighbors
 
 TIMES: dict[str, float] = defaultdict(float)
@@ -44,9 +46,10 @@ def timed(name: str, fn, label=None):
 
 def instrument() -> None:
     d4 = d4_module
-    batched_module.build_batched = timed("neighbour list", batched_module.build_batched)
+    d4.build_flat = timed("neighbour list", d4.build_flat)
+    NeighborMatrix.restrict = timed("neighbour list restrict", NeighborMatrix.restrict)
     d4.check_coincident = timed("coincidence check", d4.check_coincident)
-    d4._pad_system = timed("padding + reference C6", d4._pad_system)
+    d4._tables = timed("reference tables", d4._tables)
     labels = {"_graph": "graph stage forward (CN, EEQ, C6)"}
     graph_fn = d4.graph_fn
 
@@ -55,15 +58,25 @@ def instrument() -> None:
 
     d4.graph_fn = timed_graph_fn  # ty: ignore[invalid-assignment]
     eeq = d4.eeq
-    eeq.ewald_alpha = timed("EEQ setup: Ewald alpha", eeq.ewald_alpha)
+    eeq.ewald_alphas = timed("EEQ setup: Ewald alphas", eeq.ewald_alphas)
     eeq.wigner_seitz_images = timed("EEQ setup: Wigner-Seitz pairs", eeq.wigner_seitz_images)
     eeq.direct_coulomb = timed("EEQ direct Coulomb forward", eeq.direct_coulomb)
-    run_tiles = timed(
-        "tiles", d4.run_tiles, lambda a, k: "two-body tiles" if a[5] == 1 else "ATM tiles"
-    )
-    d4.run_tiles = run_tiles
-    d4.TileLayout.build = timed("tile layout (reshape)", d4.TileLayout.build)
+    d4._two_body = timed("two-body tiles (whole batch)", d4._two_body)
+    d4._three_body = timed("ATM tiles (per system)", d4._three_body)
     d4.close_chain = timed("chain closure", d4.close_chain)
+
+
+def md_cells() -> list:
+    """15 cells of 144-768 atoms (5460 atoms), the shape of li_diffusion's MD batches."""
+    crystals = {a.info["name"]: a for a in read(FIXTURES / "structures.extxyz", ":")}
+    reps = [
+        ("benzamide", (3, 3, 1)), ("benzamide", (4, 4, 2)), ("benzamide", (4, 4, 3)),
+        ("bromobenzene", (3, 3, 2)), ("bromobenzene", (4, 4, 3)), ("cyclohexane", (2, 2, 2)),
+        ("cyclohexane", (3, 3, 2)), ("cyclohexane", (3, 3, 3)), ("dmso", (3, 3, 2)),
+        ("dmso", (4, 4, 2)), ("dmso", (4, 4, 3)), ("emim_ntf2", (2, 2, 2)),
+        ("emim_ntf2", (3, 2, 2)), ("glycerol", (3, 3, 2)), ("glycerol", (3, 3, 3)),
+    ]  # fmt: skip
+    return [crystals[f"{name}_crystal"].repeat(r) for name, r in reps]
 
 
 def small_cells(n: int) -> list:
@@ -95,6 +108,11 @@ def profile(atoms_list, s9: float, repeats: int) -> dict[str, Any]:
 
     call()  # warm-up and compilation
     torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    call()
+    torch.cuda.synchronize()
+    peak_gib = (torch.cuda.max_memory_allocated() - base) / 2**30
     totals = []
     TIMES.clear()
     for _ in range(repeats):
@@ -118,6 +136,7 @@ def profile(atoms_list, s9: float, repeats: int) -> dict[str, Any]:
         "total_s": statistics.median(totals),
         "stages_s": stages,
         "cuda_kernel_launches": launches,
+        "peak_gib": peak_gib,
     }
 
 
@@ -128,17 +147,19 @@ def main() -> None:
     args = parser.parse_args()
     instrument()
     batches = {
-        "fixture crystals (12 cells, 144-1000 atoms)": build_batch(),
-        "64 small cells (64 atoms)": small_cells(64),
+        "li_diffusion MD shape (15 cells, 144-768 atoms)": (md_cells(), (0.0,)),
+        "fixture crystals (12 cells, 144-1000 atoms)": (build_batch(), (0.0, 1.0)),
+        "64 small cells (64 atoms)": (small_cells(64), (0.0, 1.0)),
     }
     results = []
-    for name, atoms_list in batches.items():
-        for s9 in (0.0, 1.0):
+    for name, (atoms_list, s9_values) in batches.items():
+        for s9 in s9_values:
             r: dict[str, Any] = profile(atoms_list, s9, args.repeats) | {"batch": name}
             results.append(r)
             print(
                 f"\n== {name}, s9 = {s9}: {r['total_s']:.3f} s, {r['atoms']} atoms, "
-                f"{r['cuda_kernel_launches']} CUDA kernel launches"
+                f"{r['cuda_kernel_launches']} CUDA kernel launches, "
+                f"peak {r['peak_gib']:.2f} GiB above the inputs"
             )
             for k, v in r["stages_s"].items():
                 print(f"  {k:40s} {v:8.4f} s")

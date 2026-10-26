@@ -1,7 +1,7 @@
 from torch import Tensor
 
 from ..settings import BruteForceNeighbors, NeighborBackend, NvalchemiNeighbors
-from .base import NeighborBuilder, NeighborMatrix, from_pairs
+from .base import NeighborBuilder, NeighborMatrix, concat, from_pairs
 from .brute_force import BruteForceBuilder, brute_force_neighbors
 
 
@@ -15,31 +15,33 @@ def make_builder(backend: NeighborBackend) -> NeighborBuilder:
     raise TypeError(f"unknown neighbour backend {backend!r}")
 
 
-def build_batched(
+def build_flat(
     backend: NeighborBackend,
     positions: Tensor,
     cells: Tensor | None,
     pbc: bool,
     cutoff: float,
     counts: list[int],
-) -> list[NeighborMatrix]:
-    """Neighbour lists of a batch of systems concatenated along the atom axis (``counts`` atoms
-    each, cells (S, 3, 3) or None without PBC), one matrix per system with system-local indices.
+) -> NeighborMatrix:
+    """The neighbour list of a batch of systems concatenated along the atom axis (``counts``
+    atoms each, cells (S, 3, 3) or None without PBC) as one flat matrix with global indices:
+    each row lists neighbours from its own system only. Vectors take the cell of each row's
+    system, ``nl.vectors(positions, cells[system])``.
 
-    nvalchemiops builds the whole batch in one ``system_idx``-aware call; the brute-force
-    backend builds each system on its own."""
+    nvalchemiops builds the whole batch in one ``system_idx``-aware call; the brute-force backend
+    builds each system on its own and concatenates."""
     if isinstance(backend, NvalchemiNeighbors):
         from .nvalchemi import NvalchemiBuilder
 
         builder = NvalchemiBuilder(backend.method, backend.max_neighbors)
         return builder.batch(positions, cells, pbc, cutoff, counts)
     single = make_builder(backend)
-    result, start = [], 0
+    matrices, start = [], 0
     for s, n in enumerate(counts):
         cell = cells[s] if cells is not None else None
-        result.append(single(positions[start : start + n], cell, pbc, cutoff))
+        matrices.append(single(positions[start : start + n], cell, pbc, cutoff))
         start += n
-    return result
+    return concat(matrices)
 
 
 __all__ = [
@@ -47,7 +49,8 @@ __all__ = [
     "NeighborMatrix",
     "BruteForceBuilder",
     "brute_force_neighbors",
-    "build_batched",
+    "build_flat",
+    "concat",
     "from_pairs",
     "make_builder",
 ]

@@ -5,8 +5,8 @@ import pytest
 import torch
 from conftest import BOHR, DEVICES, names, random_cell, structures
 
-from torch_dispersion.neighbors import NeighborMatrix, brute_force_neighbors, build_batched
-from torch_dispersion.settings import NvalchemiNeighbors
+from torch_dispersion.neighbors import NeighborMatrix, brute_force_neighbors, build_flat
+from torch_dispersion.settings import BruteForceNeighbors, NvalchemiNeighbors
 
 
 def nvalchemi(*args, **kwargs):
@@ -75,26 +75,33 @@ BATCHES = {
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("method", [None, "naive", "cell_list"])
 @pytest.mark.parametrize("batch", list(BATCHES))
-def test_batched_neighbor_sets(batch, method, device):
-    """One system_idx-aware nvalchemiops call over a batch gives, per system and with
-    system-local indices, the brute-force set of that system alone."""
+def test_flat_neighbor_sets(batch, method, device):
+    """One system_idx-aware nvalchemiops call over a batch gives the flat list (global indices)
+    of the brute-force lists of the systems alone, and vectors with per-row cells."""
     systems = [inputs(CASES[c](), device) for c in BATCHES[batch]]
     pbc = systems[0][2]
     positions = torch.cat([pos for pos, _, _ in systems])
     cells = torch.stack([cell for _, cell, _ in systems]) if pbc else None
     counts = [pos.shape[0] for pos, _, _ in systems]
-    got = build_batched(NvalchemiNeighbors(method=method), positions, cells, pbc, 25.0, counts)
-    assert len(got) == len(systems)
-    for nl, (pos, cell, _) in zip(got, systems, strict=True):
-        assert nl.n_atoms == pos.shape[0]
-        assert pair_set(nl) == pair_set(brute_force_neighbors(pos, cell, pbc, 25.0))
+    got = build_flat(NvalchemiNeighbors(method=method), positions, cells, pbc, 25.0, counts)
+    ref = build_flat(BruteForceNeighbors(), positions, cells, pbc, 25.0, counts)
+    assert got.n_atoms == ref.n_atoms == sum(counts)
+    assert pair_set(got) == pair_set(ref)
+    system = torch.repeat_interleave(
+        torch.arange(len(counts), device=device), torch.tensor(counts, device=device)
+    )
+    row_cells = None if cells is None else cells[system]
+    r2 = got.vectors(positions, row_cells).square().sum(-1)
+    assert bool((r2[got.mask] <= 25.0**2 * (1 + 1e-12)).all())
+    i, j, _ = got.to_pairs()
+    assert torch.equal(system[i], system[j]), "neighbours must stay within their system"
 
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_batched_overflow_raises(device):
     pos, cell, pbc = inputs(structures()["dmso_crystal"], device)
     with pytest.raises(RuntimeError, match="overflow"):
-        build_batched(
+        build_flat(
             NvalchemiNeighbors(max_neighbors=100),
             torch.cat([pos, pos]),
             torch.stack([cell, cell]),

@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from ase.io import read
 
+from torch_dispersion.core.batch import Batch
 from torch_dispersion.core.padding import pad_positions
 from torch_dispersion.d4 import d4_dispersion, eeq
 from torch_dispersion.d4.data import d4_reference_data
@@ -72,7 +73,9 @@ def eeq_call(atoms, settings, grad: bool):
     weights = torch.randn(len(atoms), device=device, dtype=f64)
     rad, eta = data.eeq_rad[z], data.eeq_eta[z]
     chi, kcnchi = data.eeq_chi[z], data.eeq_kcnchi[z]
-    total = torch.zeros((), dtype=f64, device=device)
+    total = torch.zeros(1, dtype=f64, device=device)
+    batch = Batch.from_counts([len(atoms)], device)
+    cells = cell[None]
 
     def fn():
         leaf = pos.clone().requires_grad_(grad)
@@ -85,10 +88,13 @@ def eeq_call(atoms, settings, grad: bool):
                 rc[z],
                 rc[zp][nl.indices],
             )
-            alpha = torch.tensor(eeq.ewald_alpha(cell), dtype=f64, device=device)
-            pairs = eeq.wigner_seitz_images(leaf.detach(), cell)
-            a_dir = eeq.direct_coulomb(leaf, cell, rad, alpha, pairs, settings.compile)
-            q = _charges(cn, leaf, cell, a_dir, rad, eta, chi, kcnchi, alpha, total)
+            alphas = eeq.ewald_alphas(cells)
+            pairs = eeq.wigner_seitz_images(leaf.detach(), cells, batch)
+            a_dir = eeq.direct_coulomb(leaf, cells, rad, alphas, pairs, batch, settings.compile)
+            q = _charges(
+                cn, leaf, cells, a_dir, rad, eta, chi, kcnchi, alphas, total, batch.index,
+                batch.mask,
+            )  # fmt: skip
             if grad:
                 torch.autograd.grad((q * weights).sum(), leaf)
 

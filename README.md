@@ -134,10 +134,13 @@ from torch_dispersion.calculators.torchsim import D4Model
 model = SumModel(mlip, D4Model(settings))  # energy (S,), forces (N, 3), stress (S, 3, 3)
 ```
 
-The neighbour list is built once for the whole batch (nvalchemiops, `system_idx`-aware). CN,
-EEQ (one total charge per system), C6 and the tile kernels run per system, on that system's C6
-block. Each system's result equals `d4_dispersion` on it. A batch must be all periodic or all
-molecular. Design, outputs, limits and timings:
+Every stage runs on the whole batch at once: one neighbour list (nvalchemiops,
+`system_idx`-aware), one compiled graph stage (CN, a batched EEQ solve with one total charge
+per system, per-system C6 blocks), one two-body tile loop over all atoms and one backward pass;
+the ATM term (s9 ≠ 0) runs per system. Each system's result equals `d4_dispersion` on it to
+rounding. A batch must be all periodic or all molecular. On a B200, energy, forces and stress
+of a 15-cell, 5460-atom batch at the default cutoffs (s9 = 0) take 0.32 s; 64 cells of 64 atoms
+take 0.13 s. Design, outputs, limits and timings:
 [`docs/d4.md#torchsim-model-batched`](docs/d4.md#torchsim-model-batched).
 
 ## Package layout
