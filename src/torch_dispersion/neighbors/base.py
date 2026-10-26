@@ -191,9 +191,11 @@ def from_pairs(i: Tensor, j: Tensor, shifts: Tensor, n_atoms: int) -> NeighborMa
 
 
 def shift_dtype(shifts: Tensor) -> torch.dtype:
-    """int8 if every lattice shift fits (one host sync), else int16."""
-    if shifts.numel() and int(shifts.abs().max()) > 127:
-        return torch.int16
+    """int8 if every lattice shift fits (one host sync, no copy of ``shifts``), else int16."""
+    if shifts.numel():
+        extremes = torch.stack([shifts.amax(), -shifts.amin()])
+        if int(extremes.max()) > 127:
+            return torch.int16
     return torch.int8
 
 
