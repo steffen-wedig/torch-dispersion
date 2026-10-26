@@ -166,7 +166,7 @@ class D4Settings(_EvalSettings):
     coordination_cutoff_bohr: float = Field(default=30.0, gt=0)
     """Range of the D4 coordination number. The EEQ coordination number has its own fixed
     25 bohr range (part of the EEQ-2019 model)."""
-    pair_block_size: int = Field(default=256, gt=0)
+    pair_block_size: int = Field(default=512, gt=0)
     """Centres per two-body kernel call. Much larger than the ATM's ``centre_block_size``: a
     pair tile is (B, T), not (B, T, T), and fewer, larger calls keep the per-call overhead
     small."""

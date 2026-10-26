@@ -139,8 +139,8 @@ Every stage runs on the whole batch at once: one neighbour list (nvalchemiops,
 per system, per-system C6 blocks), one two-body tile loop over all atoms and one backward pass;
 the ATM term (s9 ≠ 0) runs per system. Each system's result equals `d4_dispersion` on it to
 rounding. A batch must be all periodic or all molecular. On a B200, energy, forces and stress
-of a 15-cell, 5460-atom batch at the default cutoffs (s9 = 0) take 0.32 s; 64 cells of 64 atoms
-take 0.13 s. Design, outputs, limits and timings:
+of a 15-cell, 5460-atom batch at the default cutoffs (s9 = 0) take 0.17 s; 64 cells of 64 atoms
+take 0.06 s. Design, outputs, limits and timings:
 [`docs/d4.md#torchsim-model-batched`](docs/d4.md#torchsim-model-batched).
 
 ## Package layout
