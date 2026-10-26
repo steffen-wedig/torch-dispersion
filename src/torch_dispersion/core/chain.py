@@ -39,9 +39,9 @@ class Strained:
     """The leaves of the graph stage and the strained geometry built from them."""
 
     pos_leaf: Tensor  # (n, 3) requires grad if forces are wanted
-    strain: Tensor  # (3, 3) zero, requires grad if the stress is wanted
+    strain: Tensor  # (3, 3), or (S, 3, 3) for a batch: zero, requires grad if stress is wanted
     positions: Tensor  # (n, 3) pos_leaf (1 + strain) with PBC, else pos_leaf
-    cell: Tensor | None  # cell (1 + strain), None without PBC
+    cell: Tensor | None  # cell (1 + strain), (3, 3) or (S, 3, 3); None without PBC
     compute_forces: bool
     compute_stress: bool
 
@@ -51,16 +51,30 @@ class Strained:
 
 
 def strained(
-    pos: Tensor, cell: Tensor | None, compute_forces: bool, compute_stress: bool
+    pos: Tensor,
+    cell: Tensor | None,
+    compute_forces: bool,
+    compute_stress: bool,
+    system: Tensor | None = None,
 ) -> Strained:
-    """Leaves for dE/dR and dE/dε at ε = 0; ``compute_stress`` requires a cell."""
-    pos_leaf = pos.clone().requires_grad_(compute_forces)
-    strain = torch.zeros((3, 3), dtype=pos.dtype, device=pos.device, requires_grad=compute_stress)
+    """Leaves for dE/dR and dE/dε at ε = 0; ``compute_stress`` requires a cell. For a batch,
+    ``cell`` is (S, 3, 3) and ``system`` (n,) the system of each atom: one strain per system."""
+    batch = () if cell is None or cell.dim() == 2 else (cell.shape[0],)
+    shape = (*batch, 3, 3)
+    strain = torch.zeros(shape, dtype=pos.dtype, device=pos.device, requires_grad=compute_stress)
     deform = torch.eye(3, dtype=pos.dtype, device=pos.device) + strain
+    pos_leaf = pos.clone().requires_grad_(compute_forces)
+    positions = pos_leaf
+    if cell is not None:
+        if batch:
+            assert system is not None
+            positions = (pos_leaf[:, None, :] @ deform[system])[:, 0]
+        else:
+            positions = pos_leaf @ deform
     return Strained(
         pos_leaf=pos_leaf,
         strain=strain,
-        positions=pos_leaf @ deform if cell is not None else pos_leaf,
+        positions=positions,
         cell=cell @ deform if cell is not None else None,
         compute_forces=compute_forces,
         compute_stress=compute_stress,
@@ -104,7 +118,7 @@ def forces_and_stress(
     settings: _EvalSettings,
 ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
     """(forces eV/Å, stress eV/Å^3 (ASE sign, symmetrised), virial dE/dε eV) from dE/dR and
-    dE/dε in atomic units; ``cell`` in Å (for the volume)."""
+    dE/dε in atomic units; ``cell`` in Å (for the volume), (3, 3) or (S, 3, 3) with dE/dε."""
     hartree, bohr = settings.hartree_in_ev, settings.bohr_in_angstrom
     forces = stress = virial = None
     if grad_pos is not None:
@@ -114,7 +128,7 @@ def forces_and_stress(
         virial = grad_strain * hartree
         f64 = torch.float64
         volume = torch.linalg.det(torch.as_tensor(cell).to(device=virial.device, dtype=f64)).abs()
-        stress = 0.5 * (virial + virial.T) / volume
+        stress = 0.5 * (virial + virial.mT) / volume[..., None, None]
     return forces, stress, virial
 
 

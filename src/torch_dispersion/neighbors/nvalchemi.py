@@ -58,10 +58,10 @@ class NvalchemiBuilder:
 
     def batch(
         self, positions: Tensor, cells: Tensor | None, pbc: bool, cutoff: float, counts: list[int]
-    ) -> list[NeighborMatrix]:
-        """Lists of a batch of systems concatenated along the atom axis (``counts`` atoms each,
-        cells (S, 3, 3) or None without PBC), from one batched (``system_idx``-aware) library
-        call. Each returned matrix has system-local indices, as from ``__call__`` per system."""
+    ) -> NeighborMatrix:
+        """The flat list of a batch of systems concatenated along the atom axis (``counts``
+        atoms each, cells (S, 3, 3) or None without PBC) from one batched (``system_idx``-aware)
+        library call: global indices, padding index = total atom count."""
         device = positions.device
         positions = positions.detach()
         n_total, n_systems = positions.shape[0], len(counts)
@@ -83,21 +83,13 @@ class NvalchemiBuilder:
             kwargs["pbc"] = torch.ones((n_systems, 3), dtype=torch.bool, device=device)
         out = self._neighbor_list(positions, cutoff, **kwargs)
         matrix, count = out[0], out[1].to(torch.int64)
-        # one host sync for the overflow check and the per-system widths
-        widths = torch.zeros(n_systems, dtype=torch.int64, device=device)
-        widths = widths.scatter_reduce(0, system, count, "amax").tolist()
-        if max(widths) > matrix.shape[1]:
+        width = int(count.max()) if n_total else 0  # one host sync: overflow check and width
+        if width > matrix.shape[1]:
             raise RuntimeError(
-                f"nvalchemiops neighbour overflow: {max(widths)} neighbours for "
+                f"nvalchemiops neighbour overflow: {width} neighbours for "
                 f"max_neighbors={matrix.shape[1]}; set NvalchemiNeighbors.max_neighbors higher"
             )
-        result, start = [], 0
-        for n, width in zip(counts, widths, strict=True):
-            rows = slice(start, start + n)
-            shifts = out[2][rows] if pbc else None
-            result.append(_to_matrix(matrix[rows], count[rows], shifts, start, width))
-            start += n
-        return result
+        return _to_matrix(matrix, count, out[2] if pbc else None, 0, width)
 
 
 def _estimate_batch(counts: list[int], cells: Tensor | None, pbc: bool, cutoff: float) -> int:

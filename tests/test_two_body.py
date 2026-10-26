@@ -58,17 +58,19 @@ def two_body(atoms, settings) -> float:
     nl = builder(pos, cell_b, pbc, CUTOFF).pad(n_padded, tile)
     layout = TileLayout.build(nl, nl.vectors(pos_p, cell_b), system.numbers, block, tile)
     rr, r0 = rational_tables(data.r4r2, DAMPING["a1"], DAMPING["a2"])
+    rows = torch.arange(n_padded, device=device)
+    c6_index = rows[:, None] * n_padded + nl.indices  # one system: C6 (Np, Np) flattened
     energy = run_tiles(
         get_pair_step_fn(False, compile=False),
-        torch.zeros((), dtype=torch.float64, device=device),
-        (c6,),
+        torch.zeros(1, dtype=torch.float64, device=device),
+        (c6.reshape(-1),),
         layout,
         n,
         1,
-        pair_inputs(rr, r0),
+        pair_inputs(rr, r0, layout.tiled(c6_index), layout.rows(torch.zeros_like(rows))),
         pair_scalars(DAMPING["s6"], DAMPING["s8"], CUTOFF, dtype, device),
     )
-    return float(energy)
+    return float(energy[0])
 
 
 @pytest.mark.parametrize("device", DEVICES)

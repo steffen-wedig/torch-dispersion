@@ -1,10 +1,10 @@
 """The batched TorchSim model ``torch_dispersion.calculators.torchsim.D4Model``.
 
 Every system of a batch must equal ``d4_dispersion`` on that system alone (energy, forces,
-stress, charges): exactly with the brute-force backend on the CPU (same per-system lists, same
-code path), to rounding with nvalchemiops (the batched list orders neighbours differently) and
-on CUDA (atomic scatter-adds are not deterministic, not even between two calls). Shortened
-cutoffs keep the CPU cases fast; the ~1000-atom mixed batches with ATM or brute force are slow.
+stress, charges) to rounding: the batch solves each system's EEQ inside a matrix padded to the
+largest system (a different LU), nvalchemiops orders the batched list differently, and CUDA's
+atomic scatter-adds are not deterministic. Shortened cutoffs keep the CPU cases fast; the
+~1000-atom mixed batches with ATM or brute force are slow.
 """
 
 import numpy as np
@@ -72,7 +72,7 @@ def to_state(atoms_list, device):
     )
 
 
-def assert_matches_loop(out, atoms_list, settings, compute_charges: bool, exact: bool):
+def assert_matches_loop(out, atoms_list, settings, compute_charges: bool):
     """``out`` equals a loop of single-system ``d4_dispersion`` calls."""
     refs = [run_d4(a, settings, charge=a.info.get("charge", 0.0)) for a in atoms_list]
     pbc = bool(atoms_list[0].pbc.all())
@@ -87,13 +87,12 @@ def assert_matches_loop(out, atoms_list, settings, compute_charges: bool, exact:
     assert set(out) == set(expected)
     for key, value in expected.items():
         assert out[key].dtype == torch.float64
-        assert_same(out[key], value, exact, atol=1e-10 if key == "charges" else 1e-12)
+        assert_same(out[key], value, atol=1e-10 if key == "charges" else 1e-12)
 
 
-def assert_same(got, expected, exact: bool, atol: float = 1e-12):
-    """Bit for bit if ``exact`` on the CPU, else to rounding. On CUDA the EEQ Coulomb matrix is
-    assembled with atomic adds, so it rounds differently from run to run, and the charges
-    amplify that strongly: 1-ulp noise in the matrix of the 1024-atom box (condition number
+def assert_same(got, expected, exact: bool = False, atol: float = 1e-12):
+    """Bit for bit if ``exact`` (on the CPU only), else to rounding. The charges amplify
+    rounding strongly: 1-ulp noise in the EEQ matrix of the 1024-atom box (condition number
     ~200) moves them by ~3e-12 e and the forces by ~6e-14 eV/Å."""
     if exact and got.device.type == "cpu":
         assert torch.equal(got, expected), (got - expected).abs().max()
@@ -126,19 +125,7 @@ def test_batch_equals_loop(batch, backend, s9, device):
     settings = make_d4_settings(device, backend=backend, s9=s9, **SHORT)
     model = D4Model(settings, compute_charges=True)
     out = model(to_state(atoms_list, device))
-    assert_matches_loop(out, atoms_list, settings, True, exact=backend == "brute_force")
-
-
-@pytest.mark.parametrize("device", DEVICES)
-@pytest.mark.parametrize("backend", ["brute_force", "nvalchemi"])
-@pytest.mark.parametrize("batch", ["equal", "molecules"])
-def test_per_system_neighbor_lists(batch, backend, device):
-    """``batch_neighbor_list=False`` (lists built system by system) equals the loop too."""
-    atoms_list = BATCHES[batch]()
-    settings = make_d4_settings(device, backend=backend, **SHORT)
-    model = D4Model(settings, compute_charges=True, batch_neighbor_list=False)
-    out = model(to_state(atoms_list, device))
-    assert_matches_loop(out, atoms_list, settings, True, exact=True)
+    assert_matches_loop(out, atoms_list, settings, True)
 
 
 @pytest.mark.parametrize("device", DEVICES)
@@ -149,7 +136,7 @@ def test_charges_output(compute_charges, device):
     settings = make_d4_settings(device, **SHORT)
     out = D4Model(settings, compute_charges=compute_charges)(to_state(atoms_list, device))
     assert ("charges" in out) == compute_charges
-    assert_matches_loop(out, atoms_list, settings, compute_charges, exact=True)
+    assert_matches_loop(out, atoms_list, settings, compute_charges)
     if compute_charges:
         totals = [float(c.sum()) for c in out["charges"].split([len(a) for a in atoms_list])]
         np.testing.assert_allclose(totals, [a.info["charge"] for a in atoms_list], atol=1e-12)
@@ -165,7 +152,7 @@ def test_energy_only_and_attributes(device):
     out = model(to_state(atoms_list, device))
     assert set(out) == {"energy"}
     expected = torch.stack([run_d4(a, settings).energy for a in atoms_list])
-    assert_same(out["energy"], expected, exact=True)
+    assert_same(out["energy"], expected)
     model.compute_forces = model.compute_stress = True
     assert set(model(to_state(atoms_list, device))) == {"energy", "forces", "stress"}
 

@@ -33,7 +33,8 @@ class NeighborMatrix:
         """Displacements (N, M, 3); zero in padding.
 
         ``positions`` has one row per matrix row. The padding index may equal that row count
-        (an unpadded matrix); it then gathers an appended zero row.
+        (an unpadded matrix); it then gathers an appended zero row. ``cell`` is one cell (3, 3)
+        or one cell per row (N, 3, 3), as in a flat batch of systems; None without PBC.
         """
         extended = torch.cat([positions, positions.new_zeros(1, 3)])
         # index_select, not extended[indices]: each atom appears in ~M rows, and the backward of
@@ -42,7 +43,7 @@ class NeighborMatrix:
         gathered = extended.index_select(0, self.indices.reshape(-1)).view(*self.indices.shape, 3)
         vec = gathered - positions[:, None, :]
         if cell is not None:
-            vec = vec + self.shifts.to(positions.dtype) @ cell
+            vec = vec + self.shifts.to(positions.dtype) @ cell  # (N, M, 3) @ (3, 3) or (N, 3, 3)
         return torch.where(self.mask[..., None], vec, 0.0)
 
     def restrict(self, positions: Tensor, cell: Tensor | None, cutoff: float) -> "NeighborMatrix":
@@ -80,10 +81,46 @@ class NeighborMatrix:
         count = torch.nn.functional.pad(self.count, (0, dr), value=0)
         return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)
 
+    def rows(self, start: int, n: int) -> "NeighborMatrix":
+        """Rows start..start+n of a flat batch matrix whose neighbours lie in the same range (one
+        system), with indices local to it (padding index n)."""
+        mask = self.mask[start : start + n]
+        indices = torch.where(mask, self.indices[start : start + n] - start, n)
+        return NeighborMatrix(
+            indices=indices,
+            shifts=self.shifts[start : start + n],
+            mask=mask,
+            count=self.count[start : start + n],
+        )
+
     def to_pairs(self) -> tuple[Tensor, Tensor, Tensor]:
         """Flat (i, j, shift) of the real entries, i ascending."""
         i = torch.arange(self.n_atoms, device=self.indices.device)[:, None].expand_as(self.mask)
         return i[self.mask], self.indices[self.mask], self.shifts[self.mask]
+
+
+def concat(matrices: list[NeighborMatrix]) -> NeighborMatrix:
+    """One flat matrix of a batch from per-system matrices with system-local indices: rows are
+    concatenated, indices offset to global atom indices, the width is the widest system's and
+    the padding index is the total atom count."""
+    counts = [m.n_atoms for m in matrices]
+    n_total, width = sum(counts), max((m.width for m in matrices), default=0)
+    parts, start = [], 0
+    for m in matrices:
+        dm = width - m.width
+        mask = torch.nn.functional.pad(m.mask, (0, dm), value=False)
+        indices = torch.nn.functional.pad(m.indices, (0, dm), value=0) + start
+        parts.append(
+            (
+                torch.where(mask, indices, n_total),
+                torch.nn.functional.pad(m.shifts, (0, 0, 0, dm), value=0),
+                mask,
+                m.count,
+            )
+        )
+        start += m.n_atoms
+    indices, shifts, mask, count = (torch.cat(x) for x in zip(*parts, strict=True))
+    return NeighborMatrix(indices=indices, shifts=shifts, mask=mask, count=count)
 
 
 def from_pairs(i: Tensor, j: Tensor, shifts: Tensor, n_atoms: int) -> NeighborMatrix:

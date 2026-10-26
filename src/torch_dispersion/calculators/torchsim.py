@@ -8,18 +8,18 @@ Importing this module imports ``torch_sim`` (the ``torchsim`` extra); the packag
 
     model = SumModel(mlip, D4Model(D4Settings(s8=..., a1=..., a2=..., s9=0.0)))
 
-The batch is evaluated by ``torch_dispersion.d4.d4_dispersion_batched``: one batched
-neighbour list, then per system the graph stage, EEQ solve, tile kernels and chain closure on
-that system's own C6 block. Energies, forces and stresses come from the analytic kernels plus
-one internal autograd pass, so ``positions.requires_grad`` is not needed and all outputs are
-detached.
+The batch is evaluated by ``torch_dispersion.d4.d4_dispersion_batched`` as a whole: one
+neighbour list, one graph stage (CN, a batched EEQ solve, per-system C6 blocks), one two-body
+tile loop over all atoms (the ATM term, if s9 != 0, runs per system) and one autograd pass.
+Energies, forces and stresses come from the analytic kernels plus that internal autograd pass,
+so ``positions.requires_grad`` is not needed and all outputs are detached.
 """
 
 import torch
 from torch_sim.models.interface import ModelInterface
 from torch_sim.state import SimState
 
-from ..d4.batched import d4_dispersion_batched
+from ..d4 import d4_dispersion_batched
 from ..settings import D4Settings
 
 
@@ -37,10 +37,6 @@ class D4Model(ModelInterface):
     The total charge of each system is the state's ``total_charge`` (or ``charge``) per-system
     extra if present, else 0. The batch's ``pbc`` must be all True or all False: TorchSim
     states carry one ``pbc`` for the whole batch, and D4 supports only molecules and 3D cells.
-
-    ``batch_neighbor_list=False`` builds each system's neighbour list just before it is
-    evaluated instead of all in one batched call: the peak memory of a per-system loop, at the
-    cost of one list launch per system (see ``d4_dispersion_batched``).
     """
 
     def __init__(
@@ -50,13 +46,11 @@ class D4Model(ModelInterface):
         compute_forces: bool = True,
         compute_stress: bool = True,
         compute_charges: bool = False,
-        batch_neighbor_list: bool = True,
         dtype: torch.dtype = torch.float64,
     ) -> None:
         super().__init__()
         self.settings = settings
         self.compute_charges = compute_charges
-        self.batch_neighbor_list = batch_neighbor_list
         self._device = settings.torch_device
         self._dtype = dtype
         self._compute_forces = compute_forces
@@ -91,7 +85,6 @@ class D4Model(ModelInterface):
             charges=charge,
             compute_forces=self._compute_forces,
             compute_stress=self._compute_stress,
-            batch_neighbor_list=self.batch_neighbor_list,
         )
         out = {"energy": result.energy}
         if result.forces is not None:

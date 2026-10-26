@@ -44,13 +44,15 @@ def dummy_tile(device, block=4, tile=16, n=9, box=30.0, cutoff=20.0):
         mask=mask,
         z_centre=numbers[centre],
         z=numbers[idx],
+        c6_index=centre[:, None] * n + idx,  # one system: C6 (n, n) flattened
+        system=torch.zeros_like(centre),
         rr=rr,
         r0=0.5 * torch.sqrt(rr) + 5.7,
     )
     c6 = (torch.rand(n, n, generator=g, dtype=f64) * 30 + 1).to(device)
     c6 = 0.5 * (c6 + c6.T)
     scalars = rational.pair_scalars(1.0, 0.6, cutoff, f64, torch.device(device))
-    return pos, c6, inputs, scalars
+    return pos, c6.reshape(-1), inputs, scalars
 
 
 def vectors(pos, t):
@@ -66,8 +68,8 @@ def test_pair_kernel_fullgraph(with_grad, device):
 
     def zero():
         if with_grad:
-            return zero_accumulators(c6.shape[0], torch.device(device))
-        return torch.zeros((), dtype=torch.float64, device=device)
+            return zero_accumulators(pos.shape[0], torch.device(device), 1, c6.numel())
+        return torch.zeros(1, dtype=torch.float64, device=device)
 
     compiled = rational.get_pair_step_fn(with_grad, compile=True)(zero(), v, c6, t, s)
     eager = rational.get_pair_step_fn(with_grad, compile=False)(zero(), v, c6, t, s)
@@ -85,13 +87,14 @@ def test_pair_gradients_match_autograd(compile, device):
     pos, c6, t, s = dummy_tile(device)
     pos_leaf, c6_leaf = pos.clone().requires_grad_(), c6.clone().requires_grad_()
     v = vectors(pos_leaf, t)
-    zero = torch.zeros((), dtype=torch.float64, device=device)
+    zero = torch.zeros(1, dtype=torch.float64, device=device)
     energy = rational.energy_step(zero, v, c6_leaf, t, s)
-    grad_pos, grad_c6, grad_v = torch.autograd.grad(energy, (pos_leaf, c6_leaf, v))
-    virial = torch.einsum("btx,bty->xy", v.detach(), grad_v)
+    grad_pos, grad_c6, grad_v = torch.autograd.grad(energy.sum(), (pos_leaf, c6_leaf, v))
+    virial = torch.einsum("btx,bty->xy", v.detach(), grad_v)[None]
 
     step = rational.get_pair_step_fn(True, compile)
-    acc = step(zero_accumulators(c6.shape[0], torch.device(device)), v.detach(), c6, t, s)
+    acc0 = zero_accumulators(pos.shape[0], torch.device(device), 1, c6.numel())
+    acc = step(acc0, v.detach(), c6, t, s)
     assert bool(grad_pos.abs().sum() > 0) and bool(grad_c6.abs().sum() > 0)
     torch.testing.assert_close(acc.energy, energy.detach(), rtol=1e-14, atol=0)
     torch.testing.assert_close(acc.grad_pos, grad_pos, rtol=1e-12, atol=1e-20)

@@ -1,16 +1,23 @@
-"""Orchestration: ``d4_dispersion(...) -> D4Result`` (dftd4 4.3.0 ``get_dispersion``).
+"""Orchestration: ``d4_dispersion_batched(...) -> D4BatchResult`` and ``d4_dispersion(...) ->
+D4Result`` (dftd4 4.3.0 ``get_dispersion``), one code path for a batch of S systems (a single
+system is a batch of one).
 
-Gradient strategy, as for the D3 ATM term (``core.chain``):
+The atoms of all systems are concatenated (system by system). Gradient strategy, as for the D3
+ATM term (``core.chain``), with every stage working on the whole batch at once:
 
-1. graph stage (autograd): positions and strain -> D4 CN, EEQ CN -> EEQ charges (Coulomb matrix,
-   bordered solve) -> charge-scaled reference weights -> C6(q) (two-body) and C6(q = 0) (ATM);
-2. blocked stage on detached C6: the two-body pair tiles and the ATM triple tiles each return
-   their energy and gradients with respect to the displacement vectors and to their C6 matrix,
-   accumulated into dE/dR, the strain virial, dE/dC6(q) and dE/dC6(0);
-3. one ``torch.autograd.grad`` through both C6 matrices adds the CN and charge contributions.
+1. graph stage (autograd): positions and one strain per system -> D4 CN and EEQ CN over the flat
+   neighbour list -> EEQ charges (per-system Coulomb matrices in a padded (S, n_max, n_max)
+   layout, one batched bordered solve with the per-system total charges) -> charge-scaled
+   reference weights -> C6(q) (two-body) and C6(q = 0) (ATM) as per-system blocks
+   (S, n_max, n_max);
+2. tile stage on detached C6: the two-body pair tiles run over all atoms of the batch at once
+   (the kernel reads each pair's C6 from its system's block); the ATM triple tiles, when
+   s9 != 0, run system by system on that system's C6(q = 0) block. Both return their energy and
+   their gradients with respect to the displacement vectors and to C6;
+3. one ``torch.autograd.grad`` through both C6 adds the CN and charge contributions.
 
 Internally everything is in bohr and Hartree; the API takes and returns Å and eV. The EEQ stage
-always runs in float64 (it is O(N^2) and its Ewald sums cancel strongly).
+always runs in float64 (it is O(n^2) per system and its Ewald sums cancel strongly).
 """
 
 from collections.abc import Sequence
@@ -20,12 +27,12 @@ import torch
 from torch import Tensor
 
 from ..atm.kernel import KernelParams, get_step_fn, triple_inputs
-from ..core.c6 import pairwise_c6
-from ..core.chain import close_chain, forces_and_stress, graph_fn, strained, zero_outputs
-from ..core.inputs import check_coincident, check_numbers, prepare
+from ..core.batch import Batch, pad_to_systems
+from ..core.chain import Strained, close_chain, forces_and_stress, graph_fn, strained
+from ..core.inputs import check_coincident, check_numbers, check_pbc, to_bohr
 from ..core.padding import CN_WIDTH_MULTIPLE, pad_numbers, pad_positions, padded_size
 from ..core.tiles import Accumulators, TileLayout, run_tiles, zero_energy_or_accumulators
-from ..neighbors import NeighborMatrix, make_builder
+from ..neighbors import NeighborMatrix, build_flat
 from ..pairwise.rational import get_pair_step_fn, pair_inputs, pair_scalars, rational_tables
 from ..settings import D4Settings
 from . import eeq
@@ -45,13 +52,24 @@ class D4Result:
 
 
 @dataclass
-class _System:
-    """Atoms padded with dummies (Z = 0, at the origin, no references) to ``n_padded`` rows."""
+class D4BatchResult:
+    energy: Tensor  # (S,) eV, two-body + three-body
+    forces: Tensor | None  # (N, 3) eV/Å
+    stress: Tensor | None  # (S, 3, 3) eV/Å^3, ASE convention, symmetrised; None without PBC
+    virial: Tensor | None  # (S, 3, 3) eV, dE/dε; None without PBC
+    two_body_energy: Tensor  # (S,) eV
+    three_body_energy: Tensor  # (S,) eV
+    charges: Tensor  # (N,) EEQ partial charges (e)
 
-    n: int
+
+@dataclass
+class _Tables:
+    """Per-row reference tables of the flat batch padded with dummies (Z = 0, at the origin, no
+    references) to ``Np`` rows, and the reference C6 of the batch's species."""
+
     numbers: Tensor  # (Np,)
-    species: Tensor  # (Np,) index into the unique elements
-    c6_species: Tensor  # (S, S, R, R) reference C6
+    species: Tensor  # (Np,) index into the unique elements of the batch (0 = the dummy)
+    c6_reference: Tensor  # (T, R, T, R) reference C6 of the species of the batch
     rcov: Tensor  # (Np,)
     en: Tensor  # (Np,)
     reference_cn: Tensor  # (Np, R)
@@ -61,14 +79,13 @@ class _System:
     hardness: Tensor  # (Np,)
 
 
-def _pad_system(numbers: Tensor, n_padded: int, data: D4ReferenceData) -> _System:
+def _tables(numbers: Tensor, n_padded: int, data: D4ReferenceData) -> _Tables:
     z, unique, species = pad_numbers(numbers, n_padded)
     alpha = data.alpha_iw[unique]
-    return _System(
-        n=numbers.shape[0],
+    return _Tables(
         numbers=z,
         species=species,
-        c6_species=reference_c6(alpha, alpha),
+        c6_reference=reference_c6(alpha, alpha).permute(0, 2, 1, 3),
         rcov=data.covalent_radius[z],
         en=data.electronegativity[z],
         reference_cn=data.reference_cn[z],
@@ -90,12 +107,12 @@ def _coordination_numbers(
     en: Tensor,
     cutoff: float,
 ) -> tuple[Tensor, Tensor]:
-    """(D4 CN, EEQ CN) of the padded system; fixed-shape, compiles with ``fullgraph=True``."""
+    """(D4 CN, EEQ CN) of the padded rows; fixed-shape, compiles with ``fullgraph=True``."""
     cn = d4_coordination_number(vec_cn, mask_cn, rcov, rcov[idx_cn], en, en[idx_cn], cutoff)
     return cn, eeq.eeq_coordination_number(vec_eeq, mask_eeq, rcov, rcov[idx_eeq])
 
 
-def _c6_pair(
+def _c6_blocks(
     cn: Tensor,
     q: Tensor,
     reference_cn: Tensor,
@@ -104,36 +121,62 @@ def _c6_pair(
     zeff: Tensor,
     hardness: Tensor,
     species: Tensor,
-    c6_species: Tensor,
+    c6_reference: Tensor,
+    index: Tensor,
+    mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """C6 with the EEQ charges (two-body) and with q = 0 (ATM)."""
+    """Per-system C6 blocks (S, n_max, n_max) with the EEQ charges (two-body) and with q = 0
+    (ATM). C6_ij = sum_ab w_ia w_jb C6_ref(Z_i a, Z_j b) is one matmul per system, W C6_ref W^T,
+    with the weights of atom i placed in the reference slots of its species."""
+    n = index.shape[0]
+    n_systems, n_max = mask.shape
+    n_species, n_ref = c6_reference.shape[:2]
+    c6_ref = c6_reference.reshape(n_species * n_ref, n_species * n_ref)
     args = (reference_cn, reference_q, n_gaussians, zeff, hardness)
+    # one-hot species slots by comparison (one_hot would specialise on the species count)
+    slots = torch.arange(n_species, device=species.device)
+    slot = (species[:n, None] == slots).to(cn.dtype)[:, :, None]
+
+    def blocks(weights: Tensor) -> Tensor:
+        w = (slot * weights[:n, None, :]).reshape(n, n_species * n_ref)
+        w = pad_to_systems(w, index, n_systems, n_max)
+        return w @ c6_ref @ w.mT
+
     w_q = reference_weights(cn, q, *args)
     w_0 = reference_weights(cn, torch.zeros_like(q), *args)
-    return pairwise_c6(w_q, species, c6_species), pairwise_c6(w_0, species, c6_species)
+    return blocks(w_q), blocks(w_0)
 
 
 def _charges(
     cn_eeq: Tensor,
     pos: Tensor,
-    cell: Tensor | None,
+    cells: Tensor | None,
     a_dir: Tensor | None,
     rad: Tensor,
     eta: Tensor,
     chi: Tensor,
     kcnchi: Tensor,
-    alpha: Tensor,
+    alphas: Tensor,
     total_charge: Tensor,
+    index: Tensor,
+    mask: Tensor,
 ) -> Tensor:
-    """EEQ charges of the n real atoms, all inputs float64. With PBC, ``a_dir`` is the direct
-    Coulomb part (``eeq.direct_coulomb``) and ``alpha`` the Ewald splitting."""
-    x = eeq.electronegativity_vector(cn_eeq, chi, kcnchi)
-    if cell is None:
-        a = eeq.coulomb_matrix_molecular(pos, rad, eta)
+    """EEQ charges (N,) of the batch, all inputs float64: per atom ``cn_eeq``, ``pos`` and the
+    EEQ tables; per system ``cells``, the direct Coulomb part ``a_dir`` (PBC), the Ewald
+    splitting ``alphas`` and ``total_charge``; ``index``/``mask`` give the padded layout."""
+    n_systems, n_max = mask.shape
+
+    def pad(x: Tensor, fill: float = 0.0) -> Tensor:
+        return pad_to_systems(x, index, n_systems, n_max, fill)
+
+    x = pad(eeq.electronegativity_vector(cn_eeq, chi, kcnchi))
+    pos_p, rad_p, eta_p = pad(pos), pad(rad, 1.0), pad(eta)
+    if cells is None:
+        a = eeq.coulomb_matrix_molecular(pos_p, mask, rad_p, eta_p)
     else:
         assert a_dir is not None
-        a = a_dir + eeq.coulomb_matrix_reciprocal(pos, cell, rad, eta, alpha)
-    return eeq.solve_charges(a, x, total_charge)
+        a = a_dir + eeq.coulomb_matrix_reciprocal(pos_p, cells, mask, rad_p, eta_p, alphas)
+    return eeq.solve_charges(a, x, mask, total_charge).reshape(-1)[index]
 
 
 def _graph(
@@ -147,19 +190,21 @@ def _graph(
     en: Tensor,
     cutoff: float,
     pos: Tensor,
-    cell: Tensor | None,
+    cells: Tensor | None,
     a_dir: Tensor | None,
     eeq_tables: tuple[Tensor, Tensor, Tensor, Tensor],
-    alpha: Tensor,
+    alphas: Tensor,
     total_charge: Tensor,
-    c6_tables: tuple[Tensor, ...],
+    index: Tensor,
+    mask: Tensor,
+    c6_tables: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """The graph stage after the host-side EEQ setup, as one function (compiled with dynamic
-    shapes, so its backward is one compiled graph too): CN and EEQ CN of the padded system ->
-    EEQ charges (n,) in float64 -> C6(q), C6(q = 0) (Np, Np).
+    """The graph stage of the whole batch after the host-side EEQ setup, as one function
+    (compiled with dynamic shapes, so its backward is one compiled graph too): CN and EEQ CN of
+    the padded rows -> EEQ charges (N,) in float64 -> C6(q), C6(q = 0) blocks (S, n_max, n_max).
 
-    ``eeq_tables`` are (rad, eta, chi, kcnchi) of the n real atoms in float64, ``c6_tables``
-    the ``_c6_pair`` tables after the charges."""
+    ``eeq_tables`` are (rad, eta, chi, kcnchi) of the N atoms in float64, ``c6_tables`` the
+    ``_c6_blocks`` tables before ``index``."""
     f64 = torch.float64
     cn, cn_eeq = _coordination_numbers(
         vec_cn, mask_cn, idx_cn, vec_eeq, mask_eeq, idx_eeq, rcov, en, cutoff
@@ -168,20 +213,22 @@ def _graph(
     q = _charges(
         cn_eeq[:n].to(f64),
         pos.to(f64),
-        None if cell is None else cell.to(f64),
+        None if cells is None else cells.to(f64),
         a_dir,
         *eeq_tables,
-        alpha,
+        alphas,
         total_charge,
+        index,
+        mask,
     )
-    q_p = torch.nn.functional.pad(q.to(cn.dtype), (0, cn.shape[0] - n))
-    c6_q, c6_0 = _c6_pair(cn, q_p, *c6_tables)
+    q_rows = torch.nn.functional.pad(q.to(cn.dtype), (0, cn.shape[0] - n))
+    c6_q, c6_0 = _c6_blocks(cn, q_rows, *c6_tables, index, mask)
     return q, c6_q, c6_0
 
 
 @dataclass(frozen=True)
 class _Terms:
-    """Which terms run, and the cutoff of the one neighbour list per system (bohr)."""
+    """Which terms run, and the cutoff of the one neighbour list (bohr)."""
 
     two_body: bool
     three_body: bool
@@ -198,8 +245,8 @@ def _terms(settings: D4Settings) -> _Terms:
 
 
 def neighbor_list_cutoff(settings: D4Settings) -> float:
-    """Cutoff (bohr) of the neighbour list ``evaluate_system`` takes: the largest of the D4 CN,
-    EEQ CN, two-body (if s6 or s8 != 0) and ATM (if s9 != 0) ranges."""
+    """Cutoff (bohr) of the neighbour list: the largest of the D4 CN, EEQ CN, two-body (if s6
+    or s8 != 0) and ATM (if s9 != 0) ranges."""
     return _terms(settings).list_cutoff
 
 
@@ -213,238 +260,347 @@ def d4_dispersion(
     compute_forces: bool = True,
     compute_stress: bool = True,
 ) -> D4Result:
-    """DFT-D4 dispersion (two-body rational damping + ATM). Positions and cell (rows = lattice
-    vectors) in Å; ``charge`` is the total charge distributed by the EEQ model.
+    """DFT-D4 dispersion (two-body rational damping + ATM) of one system. Positions and cell
+    (rows = lattice vectors) in Å; ``charge`` is the total charge distributed by the EEQ model.
 
     Returns float64 tensors on ``settings.device``: energy (eV), forces (eV/Å), stress (eV/Å^3,
     ASE sign convention), virial dE/dε (eV); stress and virial are None without PBC.
     """
-    inputs = prepare(numbers, positions, cell, pbc, settings)
-    device = settings.torch_device
-    if inputs.numbers.shape[0] == 0:
-        energy, forces, stress, virial = zero_outputs(
-            0, compute_forces, compute_stress and inputs.pbc, device
-        )
+    numbers = torch.as_tensor(numbers)
+    n = numbers.numel()
+    if n == 0:
+        f64, device = torch.float64, settings.torch_device
+        zero = torch.zeros((), dtype=f64, device=device)
+        periodic = compute_stress and check_pbc(pbc)
         return D4Result(
-            energy=energy,
-            forces=forces,
-            stress=stress,
-            virial=virial,
-            two_body_energy=energy,
-            three_body_energy=energy,
-            charges=torch.zeros((0,), dtype=torch.float64, device=device),
+            energy=zero,
+            forces=torch.zeros((0, 3), dtype=f64, device=device) if compute_forces else None,
+            stress=torch.zeros((3, 3), dtype=f64, device=device) if periodic else None,
+            virial=torch.zeros((3, 3), dtype=f64, device=device) if periodic else None,
+            two_body_energy=zero,
+            three_body_energy=zero,
+            charges=torch.zeros((0,), dtype=f64, device=device),
         )
-    check_numbers(inputs.numbers, d4_reference_data(device, settings.torch_dtype).max_number)
-    # neighbour list (no autograd): one build at the largest cutoff, the others by masking
-    builder = make_builder(settings.neighbor_backend)
-    nl_all = builder(inputs.positions, inputs.cell, inputs.pbc, neighbor_list_cutoff(settings))
-    return evaluate_system(
-        inputs.numbers,
-        inputs.positions,
-        inputs.cell,
-        cell,
-        nl_all,
-        settings,
-        charge,
-        compute_forces,
-        compute_stress,
+    cells = None if cell is None else torch.as_tensor(cell).reshape(1, 3, 3)
+    r = d4_dispersion_batched(
+        numbers, positions, cells, pbc, [n], settings, [charge], compute_forces, compute_stress
+    )
+    return D4Result(
+        energy=r.energy[0],
+        forces=r.forces,
+        stress=None if r.stress is None else r.stress[0],
+        virial=None if r.virial is None else r.virial[0],
+        two_body_energy=r.two_body_energy[0],
+        three_body_energy=r.three_body_energy[0],
+        charges=r.charges,
     )
 
 
-def evaluate_system(
+def d4_dispersion_batched(
     numbers: Tensor,
-    pos: Tensor,
-    cell_b: Tensor | None,
-    cell: Tensor | None,
-    nl_all: NeighborMatrix,
+    positions: Tensor,
+    cells: Tensor | None,
+    pbc: bool | Sequence[bool] | Tensor,
+    n_atoms: Sequence[int] | Tensor,
     settings: D4Settings,
-    charge: float,
-    compute_forces: bool,
-    compute_stress: bool,
-) -> D4Result:
-    """D4 of one system from checked inputs: int64 ``numbers`` (n >= 1) on the settings device,
-    positions and cell (None without PBC) in bohr from ``core.inputs.to_bohr``, the cell in Å
-    (for the volume), and a neighbour list of ``pos`` at ``neighbor_list_cutoff(settings)``.
+    charges: Sequence[float] | Tensor | None = None,
+    compute_forces: bool = True,
+    compute_stress: bool = True,
+) -> D4BatchResult:
+    """DFT-D4 of S systems concatenated along the atom axis: ``numbers`` (N,), ``positions``
+    (N, 3) in Å, ``cells`` (S, 3, 3) in Å with rows = lattice vectors (ignored without PBC),
+    ``n_atoms`` (S,) atoms per system, ``charges`` (S,) total charges (default 0).
 
-    Runs the three stages of the module docstring. Every tensor is sized by this one system, so
-    the batched TorchSim model (``torch_dispersion.d4.batched``) calls it once per system."""
-    device, dtype = settings.torch_device, settings.torch_dtype
-    data = d4_reference_data(device, dtype)
-    compute_stress = compute_stress and cell_b is not None
-    need_grad = compute_forces or compute_stress
-    n = numbers.shape[0]
-    terms = _terms(settings)
-    check_coincident(nl_all, pos, cell_b)
+    ``pbc`` is one setting for the whole batch, all True or all False (a batch cannot mix
+    molecules and cells). Returns float64 tensors on ``settings.device``; every system's entries
+    equal ``d4_dispersion`` on that system alone, to rounding.
 
-    def restricted(r: float) -> NeighborMatrix:
-        return nl_all if r >= terms.list_cutoff else nl_all.restrict(pos, cell_b, r)
-
-    n_padded = padded_size(n, settings.centre_block_size)
-    system = _pad_system(numbers, n_padded, data)
-
-    # stage 1: CN, charges and C6 with autograd
-    geometry = strained(pos, cell_b, compute_forces, compute_stress)
-    with torch.set_grad_enabled(need_grad):
-        q, c6_q, c6_0 = _graph_stage(
-            system, geometry.positions, geometry.cell, cell_b, restricted, settings, data, charge
-        )
-
-    # stage 2: blocked two-body pairs and ATM triples on detached C6
-    pos_d = pad_positions(geometry.positions.detach(), n_padded)
-    cell_d = None if geometry.cell is None else geometry.cell.detach()
-    acc2, acc3 = _tile_stage(
-        system, pos_d, cell_d, c6_q.detach(), c6_0.detach(), restricted, terms, settings, data,
-        need_grad,
+    Every stage holds the whole batch at once: the neighbour lists of all systems (one
+    ``system_idx``-aware nvalchemiops call), the per-system EEQ and C6 blocks (S n_max^2).
+    """
+    pbc = check_pbc(pbc)
+    device = settings.torch_device
+    counts = [int(n) for n in torch.as_tensor(n_atoms).reshape(-1).tolist()]
+    n_systems = len(counts)
+    numbers = torch.as_tensor(numbers).to(device=device, dtype=torch.int64)
+    if n_systems == 0 or min(counts) < 1:
+        raise ValueError("every system of the batch needs at least one atom")
+    if sum(counts) != numbers.shape[0]:
+        raise ValueError(f"n_atoms sums to {sum(counts)}, but there are {numbers.shape[0]} atoms")
+    if pbc and cells is None:
+        raise ValueError("cells are required with pbc")
+    total = torch.zeros(n_systems, dtype=torch.float64, device=device)
+    if charges is not None:
+        total = torch.as_tensor(charges, dtype=torch.float64).reshape(-1).to(device)
+        if total.numel() != n_systems:
+            raise ValueError(f"{total.numel()} total charges for {n_systems} systems")
+    data = d4_reference_data(device, settings.torch_dtype)
+    check_numbers(numbers, data.max_number)
+    pos = to_bohr(positions, settings)
+    cells_b = cells_a = None
+    if pbc and cells is not None:
+        cells_b = to_bohr(cells, settings).reshape(n_systems, 3, 3)
+        cells_a = torch.as_tensor(cells).reshape(n_systems, 3, 3)
+    cutoff = neighbor_list_cutoff(settings)
+    nl_all = build_flat(settings.neighbor_backend, pos, cells_b, pbc, cutoff, counts)
+    batch = Batch.from_counts(counts, device)
+    return _evaluate(
+        numbers, pos, cells_b, cells_a, batch, nl_all, settings, data, total, compute_forces,
+        compute_stress,
     )  # fmt: skip
 
-    def energy_of(acc) -> Tensor:
-        if acc is None:
-            return torch.zeros((), dtype=torch.float64, device=device)
-        return acc.energy if isinstance(acc, Accumulators) else acc
+
+def _evaluate(
+    numbers: Tensor,
+    pos: Tensor,
+    cells_b: Tensor | None,
+    cells_a: Tensor | None,
+    batch: Batch,
+    nl_all: NeighborMatrix,
+    settings: D4Settings,
+    data: D4ReferenceData,
+    total_charge: Tensor,
+    compute_forces: bool,
+    compute_stress: bool,
+) -> D4BatchResult:
+    """The three stages of the module docstring on checked inputs in bohr."""
+    device = settings.torch_device
+    f64 = torch.float64
+    compute_stress = compute_stress and cells_b is not None
+    need_grad = compute_forces or compute_stress
+    n = batch.n_atoms
+    terms = _terms(settings)
+    row_cells = None if cells_b is None else cells_b[batch.system]
+    check_coincident(nl_all, pos, row_cells)
+
+    def restricted(r: float) -> NeighborMatrix:
+        return nl_all if r >= terms.list_cutoff else nl_all.restrict(pos, row_cells, r)
+
+    n_padded = padded_size(n, settings.centre_block_size)
+    tables = _tables(numbers, n_padded, data)
+    pad_rows = (0, n_padded - n)
+    system_rows = torch.nn.functional.pad(batch.system, pad_rows)
+    local_rows = torch.nn.functional.pad(batch.local, pad_rows)
+
+    # stage 1: CN, charges and C6 with autograd
+    geometry = strained(pos, cells_b, compute_forces, compute_stress, batch.system)
+    with torch.set_grad_enabled(need_grad):
+        q, c6_q, c6_0 = _graph_stage(
+            geometry, cells_b, batch, system_rows, tables, restricted, settings, data,
+            total_charge,
+        )  # fmt: skip
+
+    # stage 2: blocked two-body pairs (whole batch) and ATM triples (per system), detached C6
+    pos_d = pad_positions(geometry.positions.detach(), n_padded)
+    cells_d = None if geometry.cell is None else geometry.cell.detach()
+    rows_d = None if cells_d is None else cells_d[system_rows]
+    zero = torch.zeros(batch.n_systems, dtype=f64, device=device)
+    e2 = e3 = zero
+    explicit_pos = torch.zeros((n, 3), dtype=f64, device=device)
+    explicit_virial = torch.zeros((batch.n_systems, 3, 3), dtype=f64, device=device)
+    outputs: list[Tensor] = []
+    grad_outputs: list[Tensor] = []
+    if terms.two_body:
+        acc2 = _two_body(
+            c6_q.detach(), pos_d, rows_d, system_rows, local_rows, batch, tables, restricted,
+            settings, data, need_grad,
+        )  # fmt: skip
+        if isinstance(acc2, Accumulators):
+            e2 = acc2.energy
+            explicit_pos = explicit_pos + acc2.grad_pos[:n]
+            explicit_virial = explicit_virial + acc2.virial
+            outputs.append(c6_q)
+            grad_outputs.append(acc2.grad_c6.view_as(c6_q))
+        else:
+            e2 = acc2
+    if terms.three_body:
+        nl3 = restricted(settings.three_body_cutoff_bohr)
+        energies = []
+        for s, (start, n_s) in enumerate(_ranges(batch.counts)):
+            c6_block = c6_0[s, :n_s, :n_s]
+            acc3 = _three_body(
+                c6_block.detach(),
+                pos_d[start : start + n_s],
+                None if cells_d is None else cells_d[s],
+                nl3.rows(start, n_s),
+                tables.numbers[start : start + n_s],
+                settings,
+                data,
+                need_grad,
+            )
+            if isinstance(acc3, Accumulators):
+                energies.append(acc3.energy)
+                explicit_pos[start : start + n_s] += acc3.grad_pos[:n_s]
+                explicit_virial[s] += acc3.virial
+                outputs.append(c6_block)
+                grad_outputs.append(acc3.grad_c6[:n_s, :n_s])
+            else:
+                energies.append(acc3)
+        e3 = torch.stack(energies)
 
     hartree = settings.hartree_in_ev
-    e2, e3 = energy_of(acc2), energy_of(acc3)
     forces = stress = virial = None
     if need_grad:
         # stage 3: close the chain through CN, charges -> C6
-        terms_run = [(c6, acc) for c6, acc in ((c6_q, acc2), (c6_0, acc3)) if acc is not None]
-        f64 = torch.float64
-        explicit_pos = sum(
-            (acc.grad_pos for _, acc in terms_run),
-            torch.zeros((n_padded, 3), dtype=f64, device=device),
-        )
-        explicit_virial = sum(
-            (acc.virial for _, acc in terms_run), torch.zeros((3, 3), dtype=f64, device=device)
-        )
-        grads = close_chain(
-            geometry,
-            [c6 for c6, _ in terms_run],
-            [acc.grad_c6 for _, acc in terms_run],
-            explicit_pos,
-            explicit_virial,
-            n,
-        )
-        forces, stress, virial = forces_and_stress(*grads, cell, settings)
-    return D4Result(
+        grads = close_chain(geometry, outputs, grad_outputs, explicit_pos, explicit_virial, n)
+        forces, stress, virial = forces_and_stress(*grads, cells_a, settings)
+    return D4BatchResult(
         energy=(e2 + e3) * hartree,
         forces=forces,
         stress=stress,
         virial=virial,
         two_body_energy=e2 * hartree,
         three_body_energy=e3 * hartree,
-        charges=q.detach().to(torch.float64),
+        charges=q.detach().to(f64),
     )
 
 
+def _ranges(counts: Sequence[int]) -> list[tuple[int, int]]:
+    """(first atom, atom count) of each system."""
+    starts = [sum(counts[:s]) for s in range(len(counts))]
+    return list(zip(starts, counts, strict=True))
+
+
 def _graph_stage(
-    system: _System,
-    pos_s: Tensor,
-    cell_s: Tensor | None,
-    cell_b: Tensor | None,
+    geometry: Strained,
+    cells_b: Tensor | None,
+    batch: Batch,
+    system_rows: Tensor,
+    tables: _Tables,
     restricted,
     settings: D4Settings,
     data: D4ReferenceData,
-    charge: float,
+    total_charge: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Stage 1 on the (strained) positions: EEQ charges (n,), C6(q) and C6(q = 0) (Np, Np)."""
-    n, n_padded = system.n, system.numbers.shape[0]
+    """Stage 1 on the (strained) positions: EEQ charges (N,), C6(q) and C6(q = 0) blocks."""
+    n_padded = tables.numbers.shape[0]
+    pos_s, cells_s = geometry.positions, geometry.cell
     ccn = settings.coordination_cutoff_bohr
     nl_cn = restricted(ccn).pad(n_padded, CN_WIDTH_MULTIPLE)
     nl_eeq = restricted(eeq.CN_CUTOFF).pad(n_padded, CN_WIDTH_MULTIPLE)
     pos_p = pad_positions(pos_s, n_padded)
+    rows = None if cells_s is None else cells_s[system_rows]
     f64 = torch.float64
-    z = system.numbers[:n]
+    z = tables.numbers[: batch.n_atoms]
     rad = data.eeq_rad.to(f64)[z]
     eeq_tables = (rad, data.eeq_eta.to(f64)[z], data.eeq_chi.to(f64)[z], data.eeq_kcnchi.to(f64)[z])
-    # host-side EEQ setup (depends on the unstrained cell only): splitting and image pairs, then
-    # the direct Coulomb sum, which has its own analytic backward
-    alpha = torch.zeros((), dtype=f64, device=pos_s.device)
+    # host-side EEQ setup (depends on the unstrained cells only): splittings and image pairs,
+    # then the direct Coulomb sums, which have their own analytic backward
+    alphas = torch.zeros(batch.n_systems, dtype=f64, device=pos_s.device)
     a_dir = None
-    if cell_s is not None:
-        assert cell_b is not None
-        alpha = torch.tensor(eeq.ewald_alpha(cell_b), dtype=f64, device=pos_s.device)
-        pairs = eeq.wigner_seitz_images(pos_s.detach(), cell_b.to(f64))
-        pos64, cell64 = pos_s.to(f64), cell_s.to(f64)
-        a_dir = eeq.direct_coulomb(pos64, cell64, rad, alpha, pairs, settings.compile)
+    if cells_s is not None:
+        assert cells_b is not None
+        alphas = eeq.ewald_alphas(cells_b)
+        pairs = eeq.wigner_seitz_images(pos_s.detach(), cells_b.to(f64), batch)
+        pos64, cells64 = pos_s.to(f64), cells_s.to(f64)
+        a_dir = eeq.direct_coulomb(pos64, cells64, rad, alphas, pairs, batch, settings.compile)
     c6_tables = (
-        system.reference_cn,
-        system.reference_q,
-        system.n_gaussians,
-        system.zeff,
-        system.hardness,
-        system.species,
-        system.c6_species,
+        tables.reference_cn,
+        tables.reference_q,
+        tables.n_gaussians,
+        tables.zeff,
+        tables.hardness,
+        tables.species,
+        tables.c6_reference,
     )
     return graph_fn(_graph, settings.compile)(
-        nl_cn.vectors(pos_p, cell_s),
+        nl_cn.vectors(pos_p, rows),
         nl_cn.mask,
         nl_cn.indices,
-        nl_eeq.vectors(pos_p, cell_s),
+        nl_eeq.vectors(pos_p, rows),
         nl_eeq.mask,
         nl_eeq.indices,
-        system.rcov,
-        system.en,
+        tables.rcov,
+        tables.en,
         ccn,
         pos_s,
-        cell_s,
+        cells_s,
         a_dir,
         eeq_tables,
-        alpha,
-        torch.tensor(charge, dtype=f64, device=pos_s.device),
+        alphas,
+        total_charge,
+        batch.index,
+        batch.mask,
         c6_tables,
     )
 
 
-def _tile_stage(
-    system: _System,
+def _two_body(
+    c6: Tensor,
     pos_d: Tensor,
-    cell_d: Tensor | None,
-    c6_q: Tensor,
-    c6_0: Tensor,
+    rows_d: Tensor | None,
+    system_rows: Tensor,
+    local_rows: Tensor,
+    batch: Batch,
+    tables: _Tables,
     restricted,
-    terms: _Terms,
     settings: D4Settings,
     data: D4ReferenceData,
     need_grad: bool,
 ):
-    """Stage 2 on detached C6: the two-body and ATM accumulators (None for a skipped term)."""
+    """Two-body tiles over all atoms of the batch on the detached C6(q) blocks (S, n_max,
+    n_max): energy (S,) or ``Accumulators`` (per-system energy and virial, dE/dC6 flat)."""
     device, dtype = settings.torch_device, settings.torch_dtype
-    n, n_padded = system.n, system.numbers.shape[0]
-    block = settings.centre_block_size
+    n_padded = tables.numbers.shape[0]
+    block, tile = settings.centre_block_size, settings.pair_tile_size
+    cutoff = settings.two_body_cutoff_bohr
+    nl = restricted(cutoff).pad(n_padded, tile)
+    layout = TileLayout.build(nl, nl.vectors(pos_d, rows_d), tables.numbers, block, tile)
+    n_max = batch.n_max
+    c6_index = (system_rows * n_max + local_rows)[:, None] * n_max + local_rows[nl.indices]
     rr, r0 = rational_tables(data.r4r2, settings.a1, settings.a2)
-
-    def layout(cutoff: float, tile: int) -> TileLayout:
-        nl = restricted(cutoff).pad(n_padded, tile)
-        return TileLayout.build(nl, nl.vectors(pos_d, cell_d), system.numbers, block, tile)
-
-    acc2 = acc3 = None
-    if terms.two_body:
-        c2, tile2 = settings.two_body_cutoff_bohr, settings.pair_tile_size
-        acc2 = run_tiles(
-            get_pair_step_fn(need_grad, settings.compile),
-            zero_energy_or_accumulators(need_grad, n_padded, device),
-            (c6_q,),
-            layout(c2, tile2),
-            n,
-            1,
-            pair_inputs(rr, r0),
-            pair_scalars(settings.s6, settings.s8, c2, dtype, device),
-        )
-    if terms.three_body:
-        c3, tile3 = settings.three_body_cutoff_bohr, settings.neighbor_tile_size
-        # the kernel's exponent is (alpha + 2) / 3; D4 uses alp / 3
-        scal3 = KernelParams(s9=settings.s9, alpha=settings.alp - 2.0, cutoff=c3, width=0.0)
-        acc3 = run_tiles(
-            get_step_fn(need_grad, settings.compile, settings.kernel_gradient),
-            zero_energy_or_accumulators(need_grad, n_padded, device),
-            (c6_0,),
-            layout(c3, tile3),
-            n,
-            2,
-            triple_inputs(r0),
-            scal3.scalars(dtype, device),
-        )
-    return acc2, acc3
+    return run_tiles(
+        get_pair_step_fn(need_grad, settings.compile),
+        zero_energy_or_accumulators(need_grad, n_padded, device, batch.n_systems, c6.numel()),
+        (c6.reshape(-1),),
+        layout,
+        batch.n_atoms,
+        1,
+        pair_inputs(rr, r0, layout.tiled(c6_index), layout.rows(system_rows)),
+        pair_scalars(settings.s6, settings.s8, cutoff, dtype, device),
+    )
 
 
-__all__ = ["D4Result", "d4_dispersion", "evaluate_system", "neighbor_list_cutoff"]
+def _three_body(
+    c6: Tensor,
+    pos: Tensor,
+    cell: Tensor | None,
+    nl: NeighborMatrix,
+    numbers: Tensor,
+    settings: D4Settings,
+    data: D4ReferenceData,
+    need_grad: bool,
+):
+    """ATM tiles of one system on its detached C6(q = 0) block (n, n): energy () or
+    ``Accumulators`` of the system padded to the centre block size."""
+    device, dtype = settings.torch_device, settings.torch_dtype
+    n = numbers.shape[0]
+    block, tile = settings.centre_block_size, settings.neighbor_tile_size
+    n_padded = padded_size(n, block)
+    nl = nl.pad(n_padded, tile)
+    z = torch.nn.functional.pad(numbers, (0, n_padded - n))
+    layout = TileLayout.build(nl, nl.vectors(pad_positions(pos, n_padded), cell), z, block, tile)
+    c6_p = torch.nn.functional.pad(c6, (0, n_padded - n, 0, n_padded - n))
+    _, r0 = rational_tables(data.r4r2, settings.a1, settings.a2)
+    # the kernel's exponent is (alpha + 2) / 3; D4 uses alp / 3
+    cutoff = settings.three_body_cutoff_bohr
+    scalars = KernelParams(s9=settings.s9, alpha=settings.alp - 2.0, cutoff=cutoff, width=0.0)
+    return run_tiles(
+        get_step_fn(need_grad, settings.compile, settings.kernel_gradient),
+        zero_energy_or_accumulators(need_grad, n_padded, device),
+        (c6_p,),
+        layout,
+        n,
+        2,
+        triple_inputs(r0),
+        scalars.scalars(dtype, device),
+    )
+
+
+__all__ = [
+    "D4BatchResult",
+    "D4Result",
+    "d4_dispersion",
+    "d4_dispersion_batched",
+    "neighbor_list_cutoff",
+]
