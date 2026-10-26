@@ -166,9 +166,13 @@ class D4Settings(_EvalSettings):
     coordination_cutoff_bohr: float = Field(default=30.0, gt=0)
     """Range of the D4 coordination number. The EEQ coordination number has its own fixed
     25 bohr range (part of the EEQ-2019 model)."""
+    pair_block_size: int = Field(default=256, gt=0)
+    """Centres per two-body kernel call. Much larger than the ATM's ``centre_block_size``: a
+    pair tile is (B, T), not (B, T, T), and fewer, larger calls keep the per-call overhead
+    small."""
     pair_tile_size: int = Field(default=4096, gt=0)
-    """Neighbour tile width of the two-body kernel (``centre_block_size`` x ``pair_tile_size``
-    pairs per call); also the padding bucket of its neighbour axis."""
+    """Neighbour tile width of the two-body kernel (``pair_block_size`` x ``pair_tile_size``
+    pairs per call)."""
 
     @classmethod
     def from_functional(cls, name: str, atm: bool = True, **overrides: Any) -> "D4Settings":

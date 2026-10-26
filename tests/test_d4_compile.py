@@ -8,11 +8,12 @@ MD test are in ``test_d4_derivatives.py``).
 
 import pytest
 import torch
-from conftest import DEVICES, make_d4_settings, random_cell, run_d4
+from conftest import BOHR, DEVICES, make_d4_settings, random_cell, run_d4
 from torch._dynamo.utils import counters
 
-from torch_dispersion.core.tiles import zero_accumulators
+from torch_dispersion.core.tiles import SliceLayout, run_tiles, zero_accumulators
 from torch_dispersion.d4.data import d4_reference_data
+from torch_dispersion.neighbors import brute_force_neighbors
 from torch_dispersion.pairwise import rational
 
 SHORT = {
@@ -84,28 +85,65 @@ def test_pair_kernel_fullgraph(with_grad, device):
         torch.testing.assert_close(c, e, rtol=1e-13, atol=1e-18)
 
 
+def run_pair_tiles(step, acc, c6, pos, cell, numbers, nl, block, tile, cutoff):
+    """All tiles of a full neighbour list of one system (``nl`` over ``pos``) through
+    ``step``."""
+    n, n_padded = pos.shape[0], -(-(pos.shape[0] + 1) // block) * block
+    pos_p = torch.cat([pos, pos.new_zeros(n_padded - n, 3)])
+    numbers_p = torch.nn.functional.pad(numbers, (0, n_padded - n))
+    rows = torch.arange(n_padded, device=pos.device)
+    r4r2 = d4_reference_data(pos.device, pos.dtype).r4r2
+    rr, r0 = rational.rational_tables(r4r2, 0.5, 5.7)
+    return run_tiles(
+        step,
+        acc,
+        (c6, pos_p, cell.expand(n_padded, 3, 3), numbers_p, rows),
+        SliceLayout.build(nl, n_padded, block, tile),
+        n,
+        1,
+        rational.pair_inputs(rr, r0, torch.zeros_like(rows)),
+        rational.pair_scalars(1.0, 0.6, cutoff, n_padded, pos.dtype, pos.device),
+    )
+
+
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("compile", [False, True])
 def test_pair_gradients_match_autograd(compile, device):
-    """Hand-written energy, dE/dR, virial (dE/dε) and dE/dC6 of the pair kernel equal autograd
-    through the energy of strained positions and cell."""
-    (pos, cell, numbers, local), c6, t, s = dummy_tile(device)
+    """Hand-written energy, dE/dR, virial (dE/dε) and dE/dC6 of the pair kernel over all tiles
+    of a full neighbour list equal autograd through the energy of strained positions and cell.
+    The forces come from row sums (pair symmetry of the full list), so this needs a real list:
+    a small cell with self-images, several tiles per row and several centre blocks."""
+    atoms = random_cell(5, seed=3, cell_lengths=(4.0, 4.4, 4.8))
+    f64, dev = torch.float64, torch.device(device)
+    pos = torch.tensor(atoms.positions, dtype=f64, device=dev) / BOHR
+    cell = torch.tensor(atoms.cell.array, dtype=f64, device=dev) / BOHR
+    numbers = torch.tensor(atoms.numbers, device=dev)
+    cutoff, block, tile = 22.0, 4, 64
+    nl = brute_force_neighbors(pos, cell, True, cutoff)
+    n_padded = -(-(len(atoms) + 1) // block) * block
+    g = torch.Generator().manual_seed(0)
+    c6 = torch.rand(n_padded, n_padded, generator=g, dtype=f64) * 30 + 1
+    c6 = (0.5 * (c6 + c6.T)).reshape(-1).to(dev)
+
     pos_leaf, c6_leaf = pos.clone().requires_grad_(), c6.clone().requires_grad_()
-    strain = torch.zeros(3, 3, dtype=pos.dtype, device=device, requires_grad=True)
-    deform = torch.eye(3, dtype=pos.dtype, device=device) + strain
-    atoms = tables(pos_leaf @ deform, cell @ deform, numbers, local)
-    zero = torch.zeros(1, dtype=torch.float64, device=device)
-    energy = rational.energy_step(zero, c6_leaf, *atoms, t, s)
+    strain = torch.zeros(3, 3, dtype=f64, device=dev, requires_grad=True)
+    deform = torch.eye(3, dtype=f64, device=dev) + strain
+    zero = torch.zeros(1, dtype=f64, device=dev)
+    energy = run_pair_tiles(
+        rational.energy_step, zero, c6_leaf, pos_leaf @ deform, cell @ deform, numbers, nl,
+        block, tile, cutoff,
+    )  # fmt: skip
     grad_pos, grad_c6, virial = torch.autograd.grad(energy.sum(), (pos_leaf, c6_leaf, strain))
 
     step = rational.get_pair_step_fn(True, compile)
-    acc0 = zero_accumulators(pos.shape[0], torch.device(device), 1, c6.numel())
-    acc = step(acc0, c6, *tables(pos, cell, numbers, local), t, s)
+    acc0 = zero_accumulators(n_padded, dev, 1, c6.numel())
+    acc = run_pair_tiles(step, acc0, c6, pos, cell, numbers, nl, block, tile, cutoff)
+    assert nl.width > tile and n_padded > block, "several tiles and blocks"
     assert bool(grad_pos.abs().sum() > 0) and bool(grad_c6.abs().sum() > 0)
     torch.testing.assert_close(acc.energy, energy.detach(), rtol=1e-14, atol=0)
-    torch.testing.assert_close(acc.grad_pos, grad_pos, rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(acc.grad_pos[: len(atoms)], grad_pos, rtol=1e-11, atol=1e-18)
     torch.testing.assert_close(acc.grad_c6, grad_c6, rtol=1e-12, atol=1e-20)
-    torch.testing.assert_close(acc.virial, virial[None], rtol=1e-12, atol=1e-20)
+    torch.testing.assert_close(acc.virial, virial[None], rtol=1e-12, atol=1e-18)
 
 
 @pytest.mark.parametrize("device", DEVICES)

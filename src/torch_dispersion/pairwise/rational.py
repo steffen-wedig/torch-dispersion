@@ -88,8 +88,12 @@ def _tile(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """(v (B, T, 3), z_centre (B, 1), z (B, T), C6 index (B, T)) of one tile: the displacement
     x_j - x_i + shift @ cell_i (zero in padding), the atomic numbers and the entry of C6_ij in
-    the flattened per-system blocks."""
-    v = pos[t.idx] - pos[t.centre][:, None, :] + t.shift.to(pos.dtype) @ cells[t.centre]
+    the flattened per-system blocks. The 3-term products are written out as broadcast sums so
+    that they fuse into the pointwise kernel (a batched matmul with an inner size of 3 would be
+    a separate, slow GEMM call)."""
+    shift = t.shift.to(pos.dtype)
+    lattice = (shift[..., :, None] * cells[t.centre][:, None, :, :]).sum(-2)
+    v = pos[t.idx] - pos[t.centre][:, None, :] + lattice
     v = torch.where(t.mask[..., None], v, 0.0)
     row = t.system * s.n_max + local[t.centre]
     c6_index = row[:, None] * s.n_max + local[t.idx]
@@ -140,17 +144,21 @@ def gradient_step(
     t: PairTileInputs,
     s: PairScalars,
 ) -> Accumulators:
-    """Tile energy and gradients, scatter-added (pairs have little index contention)."""
+    """Tile energy and gradients.
+
+    The list is full and symmetric: pair (i, j, T) in row i has the partner (j, i, -T) in row j
+    with the same C6, damping and switching and the opposite vector, so the partner's dE/dv is
+    the negative of this one's. The force on a centre is therefore -2 x the sum of dE/dv over its
+    own row, with no scatter to the neighbours; the virial sums both copies as they are."""
     f64 = torch.float64
     v, z_centre, z, c6_index = _tile(pos, cells, numbers, local, t, s)
     g, dg = _geometry(v, z_centre, z, t, s)
     c6p = c6[c6_index]
     dv = (2.0 * c6p * dg)[..., None] * v  # dE/dv, (B, T, 3)
     dv64 = dv.to(f64)
-    grad_pos = acc.grad_pos.index_add(0, t.idx.flatten(), dv64.flatten(0, 1))
-    grad_pos = grad_pos.index_add(0, t.centre, -dv64.sum(1))
+    grad_pos = acc.grad_pos.index_add(0, t.centre, -2.0 * dv64.sum(1))
     grad_c6 = acc.grad_c6.index_add(0, c6_index.flatten(), g.to(f64).flatten())
-    virial = torch.einsum("btx,bty->bxy", v.to(f64), dv64)
+    virial = (v.to(f64)[..., :, None] * dv64[..., None, :]).sum(1)  # (B, 3, 3)
     return Accumulators(
         energy=acc.energy.index_add(0, t.system, (c6p * g).to(f64).sum(1)),
         grad_pos=grad_pos,

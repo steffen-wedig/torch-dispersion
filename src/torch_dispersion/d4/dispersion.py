@@ -547,21 +547,30 @@ def _two_body(
     """Two-body tiles over all atoms of the batch on the detached C6(q) blocks (S, n_max,
     n_max): energy (S,) or ``Accumulators`` (per-system energy and virial, dE/dC6 flat)."""
     device, dtype = settings.torch_device, settings.torch_dtype
-    n_padded = tables.numbers.shape[0]
+    n = batch.n_atoms
+    block = settings.pair_block_size
+    # the pair stage has its own (larger) centre block: pad the per-atom tables to it
+    n_padded = padded_size(n, block)
+    pad = (0, n_padded - n)
+    pos = pad_positions(pos_d[:n], n_padded)
+    cells = pos.new_zeros(n_padded, 3, 3)
+    if rows_d is not None:
+        cells[:n] = rows_d[:n]
+    numbers = torch.nn.functional.pad(tables.numbers[:n], pad)
+    local = torch.nn.functional.pad(local_rows[:n], pad)
+    system = torch.nn.functional.pad(system_rows[:n], pad)
     cutoff = settings.two_body_cutoff_bohr
     # the list as built (no padded or tiled copy); the kernel makes each tile's vectors
-    nl = restricted(cutoff)
-    layout = SliceLayout.build(nl, n_padded, settings.centre_block_size, settings.pair_tile_size)
-    cells = rows_d if rows_d is not None else pos_d.new_zeros(n_padded, 3, 3)
+    layout = SliceLayout.build(restricted(cutoff), n_padded, block, settings.pair_tile_size)
     rr, r0 = rational_tables(data.r4r2, settings.a1, settings.a2)
     return run_tiles(
         get_pair_step_fn(need_grad, settings.compile),
         zero_energy_or_accumulators(need_grad, n_padded, device, batch.n_systems, c6.numel()),
-        (c6.reshape(-1), pos_d, cells, tables.numbers, local_rows),
+        (c6.reshape(-1), pos, cells, numbers, local),
         layout,
-        batch.n_atoms,
+        n,
         1,
-        pair_inputs(rr, r0, system_rows),
+        pair_inputs(rr, r0, system),
         pair_scalars(settings.s6, settings.s8, cutoff, batch.n_max, dtype, device),
     )
 

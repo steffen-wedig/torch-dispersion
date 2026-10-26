@@ -3,8 +3,8 @@
 For li_diffusion's MD batch shape (15 cells, 5460 atoms, s9 = 0, compiled, nvalchemiops,
 energy + forces + stress), traces only the two-body stage with torch.profiler and reports:
 its wall time against the summed GPU kernel time, the number of tile calls and CUDA kernel
-launches, the evaluated pair slots against the real pairs, and the top operators by CPU and by
-GPU time.
+launches, the evaluated pair slots, and the top operators by CPU and by GPU time; then sweeps
+pair_block_size x pair_tile_size (untraced wall time of the stage).
 
     uv run python scripts/profile_d4_two_body.py
 """
@@ -60,6 +60,28 @@ d4.get_pair_step_fn = counted_step_fn  # ty: ignore[invalid-assignment]
 d4._two_body = traced_two_body  # ty: ignore[invalid-assignment]
 
 
+SWEEP = [(128, 4096), (256, 4096), (512, 4096), (256, 8192), (1024, 2048)]
+
+
+def sweep(numbers, positions, cells, counts) -> None:
+    """Untraced wall time of the two-body stage for (pair_block_size, pair_tile_size) pairs."""
+    print("\npair_block_size x pair_tile_size: two-body wall (ms)")
+    for block, tile in SWEEP:
+        settings = D4Settings.from_functional(
+            "r2scan", atm=False, device="cuda", compile=True,
+            neighbor_backend=NvalchemiNeighbors(), pair_block_size=block, pair_tile_size=tile,
+        )  # fmt: skip
+        for _ in range(2):
+            d4_dispersion_batched(numbers, positions, cells, True, counts, settings)
+        STATE["on"], STATE["trace"] = True, False
+        times = []
+        for _ in range(3):
+            d4_dispersion_batched(numbers, positions, cells, True, counts, settings)
+            times.append(STATE["wall_untraced"])
+        STATE["on"] = False
+        print(f"  {block:5d} x {tile:5d}: {min(times) * 1e3:7.1f}")
+
+
 def main() -> None:
     settings = D4Settings.from_functional(
         "r2scan", atm=False, device="cuda", compile=True, neighbor_backend=NvalchemiNeighbors()
@@ -93,6 +115,7 @@ def main() -> None:
     print(events.table(sort_by="self_cpu_time_total", row_limit=20, max_name_column_width=60))
     print("top operators by self CUDA time:")
     print(events.table(sort_by="self_cuda_time_total", row_limit=12, max_name_column_width=60))
+    sweep(numbers, positions, cells, counts)
 
 
 if __name__ == "__main__":
