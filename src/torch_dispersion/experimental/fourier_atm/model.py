@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from ...atm.kernel import KernelParams, triple_inputs
 from ...core.chain import close_chain, forces_and_stress, graph_fn, strained, zero_outputs
 from ...core.inputs import check_coincident, check_numbers, prepare
 from ...core.padding import CN_WIDTH_MULTIPLE, pad_positions, padded_size
@@ -27,8 +28,6 @@ from ...core.tiles import TileLayout, run_tiles
 from ...d3.data import pad_system, reference_data
 from ...d3.model import cn_weights_c6
 from ...neighbors import make_builder
-from ...settings import FourierATMSettings
-from ..kernel import KernelParams, triple_inputs
 from .cp import CPFit, fit_c9
 from .dipole import (
     EwaldSetup,
@@ -39,6 +38,7 @@ from .dipole import (
     trace_energy,
 )
 from .kernel import SRAccumulators, SRScalars, get_sr_step_fn, zero_sr_accumulators
+from .settings import FourierATMSettings
 from .trace_grad import TraceGradients, trace_energy_and_grad
 
 

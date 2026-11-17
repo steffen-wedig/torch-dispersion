@@ -1,6 +1,7 @@
 """Summarise a benchmark JSON (scripts/benchmark.py) as Markdown tables.
 
-uv run python scripts/benchmark_report.py benchmarks/results/h200_<job>.json > docs/benchmark.md
+    uv run python scripts/benchmark_report.py benchmarks/results/h200_<job>.json \
+        > docs/benchmarks/d3_atm.md
 """
 
 import json

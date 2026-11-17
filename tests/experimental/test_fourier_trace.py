@@ -1,5 +1,5 @@
 """FourierATM building blocks: the triple-dipole trace identity, the Bloch-Ewald dipole matrix
-and the separable C9 (docs/fourier_atm_plan.md)."""
+and the separable C9 (docs/experimental/fourier_atm.md)."""
 
 import itertools
 import math
@@ -7,18 +7,19 @@ import math
 import numpy as np
 import pytest
 import torch
-from conftest import make_fourier_settings, monomer_in_box, names, structures
+from conftest import monomer_in_box, names, structures
+from fourier_reference import make_fourier_settings
 
-from torch_dispersion.atm.fourier import separable_c9
-from torch_dispersion.atm.fourier.cp import fit_c9
-from torch_dispersion.atm.fourier.dipole import (
+from torch_dispersion.experimental.fourier_atm import separable_c9
+from torch_dispersion.experimental.fourier_atm.cp import fit_c9
+from torch_dispersion.experimental.fourier_atm.dipole import (
     EwaldSetup,
     grid_for_cell,
     molecular_dipole_matrix,
     q_grid,
     trace_energy,
 )
-from torch_dispersion.atm.fourier.model import ewald_parameters, long_range_energy
+from torch_dispersion.experimental.fourier_atm.model import ewald_parameters, long_range_energy
 from torch_dispersion.neighbors import brute_force_neighbors
 
 F64 = torch.float64

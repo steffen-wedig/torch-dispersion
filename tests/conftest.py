@@ -198,34 +198,6 @@ def random_cell(n: int, seed: int, cell_lengths=(4.5, 5.0, 5.5), angles=(80, 95,
             return atoms
 
 
-def make_fourier_settings(device="cpu", compile=False, **overrides):
-    from torch_dispersion.settings import FourierATMSettings
-
-    kwargs = {
-        "device": device,
-        "compile": compile,
-        "s9": DAMPING["s9"],
-        "alpha": DAMPING["alpha"],
-        **UNITS,
-    }
-    kwargs.update(overrides)
-    return FourierATMSettings(**kwargs)
-
-
-def run_fourier(atoms: Atoms, settings, **kwargs):
-    from torch_dispersion.atm.fourier import fourier_atm
-
-    pbc = bool(atoms.pbc.all())
-    return fourier_atm(
-        torch.tensor(atoms.numbers),
-        torch.tensor(atoms.positions),
-        torch.tensor(atoms.cell.array) if pbc else None,
-        pbc,
-        settings,
-        **kwargs,
-    )
-
-
 # cell parameters (Å, degrees) of the sparse test boxes
 BOXES = {
     "orthorhombic": (16.0, 17.0, 18.0, 90.0, 90.0, 90.0),

@@ -6,11 +6,17 @@ over all triangles with legs <= ``cutoff``. As the cutoff grows this converges (
 to the FourierATM energy with the same separable C9."""
 
 import torch
+from ase import Atoms
+from conftest import DAMPING, UNITS
 
 import torch_dispersion.atm.kernel as kernel_module
 from torch_dispersion.atm import atm_dispersion
-from torch_dispersion.atm.fourier import separable_c9
-from torch_dispersion.settings import ATMSettings, FourierATMSettings
+from torch_dispersion.experimental.fourier_atm import (
+    FourierATMSettings,
+    fourier_atm,
+    separable_c9,
+)
+from torch_dispersion.settings import ATMSettings
 
 
 def reference_energy(
@@ -68,3 +74,27 @@ def reference_energy(
     finally:
         kernel_module._terms = orig
     return float(r.energy)
+
+
+def make_fourier_settings(device="cpu", compile=False, **overrides):
+    kwargs = {
+        "device": device,
+        "compile": compile,
+        "s9": DAMPING["s9"],
+        "alpha": DAMPING["alpha"],
+        **UNITS,
+    }
+    kwargs.update(overrides)
+    return FourierATMSettings(**kwargs)
+
+
+def run_fourier(atoms: Atoms, settings, **kwargs):
+    pbc = bool(atoms.pbc.all())
+    return fourier_atm(
+        torch.tensor(atoms.numbers),
+        torch.tensor(atoms.positions),
+        torch.tensor(atoms.cell.array) if pbc else None,
+        pbc,
+        settings,
+        **kwargs,
+    )

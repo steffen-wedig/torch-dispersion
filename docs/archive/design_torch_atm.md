@@ -1,3 +1,9 @@
+> **Archived.** This is the original hand-off specification of torch-atm (2026-09-30), the
+> first term of what is now torch-dispersion. Its reference definition (§3), conventions and
+> test plan still describe the D3 ATM term; the package layout, kernel shapes and API have
+> changed since. Current documentation: [`../d3_atm.md`](../d3_atm.md) (the term) and
+> [`../implementation.md`](../implementation.md) (the shared machinery).
+
 # torch-atm — design document
 
 A standalone, GPU-capable, `torch.compile`-able PyTorch implementation of the D3

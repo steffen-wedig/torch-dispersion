@@ -10,7 +10,7 @@ the batch, as the two-body kernel (``pairwise.rational``) does:
   the centre legs from positions, neighbour indices, lattice shifts and the centre's cell;
 - C6 comes from the flattened per-system blocks (S * n_max^2) at (system, local i, local j);
   the far side (n, m) lies in the centre's system, so C6_nm is a read from the same block;
-- gradients use the pair identity of ``docs/atm_pair_gradients.md``. The triangle energy is
+- gradients use the pair identity of ``docs/notes/atm_pair_gradients.md``. The triangle energy is
   symmetric in its corners, and each side is a centre leg in two of the three visits of its
   triangle and the far side in one. So 3/2 times the centre-leg derivatives is exact, and the
   far side needs no derivative. Every derivative then belongs to an entry (i, j, shift) of row
