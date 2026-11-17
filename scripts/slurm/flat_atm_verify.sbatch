@@ -2,7 +2,8 @@
 # D4 verification on a compute node: the D4rev and TorchSim ATM benchmarks on a B200 (the
 # numbers in docs/d4.md are from job 913640), then the CPU suite and the GPU suite (incl. slow).
 # Submit from the repository root: sbatch scripts/slurm/flat_atm_verify.sbatch
-# (or SNAP=<worktree> sbatch --export=ALL ... to test a snapshot of the tree).
+# (or SNAP=<worktree> sbatch --export=ALL ... to test a snapshot of the tree; BENCH=0 skips
+# the benchmarks).
 #SBATCH --job-name=torch_dispersion_flat_atm_verify
 #SBATCH --account=mpo_inst
 #SBATCH --partition=gpu1
@@ -24,11 +25,13 @@ nvidia-smi --query-gpu=name --format=csv,noheader
 RUN="env PYTHONPATH=$SNAP/src uv run --extra torchsim"
 PYTEST="pytest -c $SNAP/pyproject.toml --rootdir $SNAP $SNAP/tests -p no:logging -p no:cacheprovider -q -ra"
 $RUN python -c "import torch_dispersion; print(torch_dispersion.__file__)"
-echo "=== benchmarks, after"
+if [ "${BENCH:-1}" != 0 ]; then
+echo "=== benchmarks"
 $RUN python $SNAP/scripts/benchmark_d4rev.py --functional wb97m-rev \
     --out "benchmarks/results/d4rev_after_${SLURM_JOB_ID}.json"
 $RUN python $SNAP/scripts/benchmark_torchsim.py --device cuda --s9 1 \
     --out "benchmarks/results/torchsim_atm_after_${SLURM_JOB_ID}.json"
+fi
 echo "=== CPU suite"
 $RUN $PYTEST -m "not gpu and not slow"
 echo "=== GPU suite"

@@ -16,14 +16,14 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from ...core.tiles import Accumulators
-from ..kernel import (
+from ...atm.kernel import (
     KernelScalars,
     TileInputs,
     _accumulate,
     _analytic_reduce,
     _terms,
 )
+from ...core.tiles import Accumulators
 
 
 class SRScalars(NamedTuple):

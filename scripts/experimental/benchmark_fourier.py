@@ -4,7 +4,8 @@ Liquids: accuracy against the real-space sum at 80 bohr (energy per atom) and wa
 energy and for energy + forces + stress. Scaling: the benzamide liquid replicated up to 8x
 (256-2048 atoms), FourierATM against real space at 25 and 40 bohr. Writes JSON, prints a table.
 
-    uv run python scripts/benchmark_fourier.py --out benchmarks/results/fourier_h200.json
+    uv run python scripts/experimental/benchmark_fourier.py \
+        --out benchmarks/results/fourier_h200.json
 """
 
 import argparse
@@ -18,10 +19,10 @@ import torch
 from ase.io import read
 
 from torch_dispersion.atm import atm_dispersion
-from torch_dispersion.atm.fourier import fourier_atm
-from torch_dispersion.settings import ATMSettings, FourierATMSettings
+from torch_dispersion.experimental.fourier_atm import FourierATMSettings, fourier_atm
+from torch_dispersion.settings import ATMSettings
 
-FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
+FIXTURES = Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 
 
 def timed(repeats: int, *call_args) -> tuple[float, float]:

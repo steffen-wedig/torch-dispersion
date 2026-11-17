@@ -15,14 +15,13 @@ from ase.build import molecule
 from ase.md.velocitydistribution import thermalize_momenta
 from ase.md.verlet import VelocityVerlet
 
-from torch_dispersion import (
+from torch_dispersion.calculators.ase import TorchATMCalculator, TorchD4Calculator
+from torch_dispersion.d4 import d4_dispersion
+from torch_dispersion.settings import (
     ATMSettings,
     BruteForceNeighbors,
     D4Settings,
     NvalchemiNeighbors,
-    TorchATMCalculator,
-    TorchD4Calculator,
-    d4_dispersion,
 )
 
 

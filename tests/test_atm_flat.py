@@ -1,7 +1,7 @@
 """The flat-batch ATM kernel (``atm.flat``) against the per-system kernel (``atm.kernel``).
 
 The flat kernel drops the far side's derivatives and scales the centre legs by 3/2
-(``docs/atm_pair_gradients.md``), so its forces, virials and dE/dC6 are summed differently
+(``docs/notes/atm_pair_gradients.md``), so its forces, virials and dE/dC6 are summed differently
 from the per-system kernel's but equal to rounding. dE/dC6 is compared symmetrised: the two
 kernels split the derivative of the symmetric C6 between (i, j) and (j, i) differently. The
 batches mix system sizes, so blocks get different tile widths and tiles span two systems.

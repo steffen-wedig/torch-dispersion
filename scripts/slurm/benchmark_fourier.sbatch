@@ -17,4 +17,4 @@ set -euo pipefail
 module load gcc/15
 export CXX="$(which g++)"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
-uv run python scripts/benchmark_fourier.py --out "benchmarks/results/fourier_h200_${SLURM_JOB_ID}.json" "$@"
+uv run python scripts/experimental/benchmark_fourier.py --out "benchmarks/results/fourier_h200_${SLURM_JOB_ID}.json" "$@"

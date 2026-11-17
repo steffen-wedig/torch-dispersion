@@ -1,31 +1,17 @@
-"""Dispersion corrections in PyTorch: DFT-D4 (dftd4 4.3.0) and the D3 Axilrod-Teller-Muto
-three-body term (simple-dftd3 1.6.0), in real space and cutoff-free (FourierATM)."""
+"""Dispersion corrections in PyTorch, with energy, forces and stress for molecules and 3D cells.
 
-from .atm import ATMResult, FourierATMResult, atm_dispersion, fourier_atm
-from .calculators import TorchATMCalculator, TorchD4Calculator
-from .d4 import D4BatchResult, D4Result, d4_dispersion, d4_dispersion_batched
-from .settings import (
-    ATMSettings,
-    BruteForceNeighbors,
-    D4Settings,
-    FourierATMSettings,
-    NvalchemiNeighbors,
-)
+Import from the submodules:
 
-__all__ = [
-    "ATMResult",
-    "ATMSettings",
-    "BruteForceNeighbors",
-    "D4BatchResult",
-    "D4Result",
-    "D4Settings",
-    "FourierATMResult",
-    "FourierATMSettings",
-    "NvalchemiNeighbors",
-    "TorchATMCalculator",
-    "TorchD4Calculator",
-    "atm_dispersion",
-    "d4_dispersion",
-    "d4_dispersion_batched",
-    "fourier_atm",
-]
+- ``torch_dispersion.d4``: ``d4_dispersion``, ``d4_dispersion_batched`` (DFT-D4, dftd4 4.3.0,
+  including ORCA's D4rev parameter sets);
+- ``torch_dispersion.atm``: ``atm_dispersion`` (D3 Axilrod-Teller-Muto term, simple-dftd3 1.6.0);
+- ``torch_dispersion.settings``: ``D4Settings``, ``ATMSettings``, ``NvalchemiNeighbors``,
+  ``BruteForceNeighbors``;
+- ``torch_dispersion.calculators.ase``: ``TorchD4Calculator``, ``TorchATMCalculator``;
+- ``torch_dispersion.calculators.torchsim``: ``D4Model`` (needs the ``torchsim`` extra);
+- ``torch_dispersion.experimental``: methods whose API may still change (``fourier_atm``).
+"""
+
+from importlib.metadata import version
+
+__version__ = version("torch-dispersion")

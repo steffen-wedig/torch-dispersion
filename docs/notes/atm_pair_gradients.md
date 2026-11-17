@@ -18,8 +18,8 @@ The derivative with respect to C6 of the far side (j, k) = (n, m) is the expensi
 - `_analytic_reduce` therefore scatters it with one-hot matmuls,
   `hot_n^T h_jk hot_m` with `hot_n`, `hot_m` of shape (B, T, Np);
 - that costs O(B (Np T² + Np² T)) per tile, so the cost of a tile grows with the system size.
-  This is the superlinear ATM gradient in `docs/benchmark_d4.md`: 0.84 s energy only but 11.7 s
-  with forces at 2048 atoms.
+  This was the superlinear ATM gradient of the per-system D4 path (H200, job 712428): 0.84 s
+  energy only but 11.7 s with forces at 2048 atoms.
 
 The far side's position derivative (`g_jk`) is cheap in the torch kernel (batched matmuls), but
 in a fused kernel it would also need a scatter onto (n, m).

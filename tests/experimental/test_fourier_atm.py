@@ -7,17 +7,15 @@ import torch
 from ase.build import molecule
 from conftest import (
     DEVICES,
-    make_fourier_settings,
     make_settings,
     monomer_in_box,
     names,
     run,
-    run_fourier,
     structures,
 )
-from fourier_reference import reference_energy
+from fourier_reference import make_fourier_settings, reference_energy, run_fourier
 
-from torch_dispersion import TorchATMCalculator
+from torch_dispersion.experimental.fourier_atm import FourierATMCalculator
 
 H_POS = 1e-4
 H_STRAIN = 1e-5
@@ -269,7 +267,7 @@ def test_float32(name, device):
 def test_calculator():
     atoms = structures()["dmso_crystal"].copy()
     fs = make_fourier_settings(**SMALL)
-    atoms.calc = TorchATMCalculator(fs)
+    atoms.calc = FourierATMCalculator(fs)
     ref = run_fourier(atoms, fs)
     assert atoms.get_potential_energy() == pytest.approx(float(ref.energy), rel=1e-13)
     np.testing.assert_allclose(atoms.get_forces(), ref.forces.numpy(), atol=1e-14)
