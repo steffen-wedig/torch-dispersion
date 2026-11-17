@@ -98,6 +98,9 @@ class TileLayout:
     vectors: Tensor  # (blocks, tiles, B, T, 3) bohr
     counts: list[int]  # per block, the longest neighbour list
 
+    def width(self, kb: int) -> int:
+        return self.tile
+
     @classmethod
     def build(
         cls, nl: NeighborMatrix, vectors: Tensor, numbers: Tensor, block: int, tile: int
@@ -132,28 +135,47 @@ class SliceLayout:
     """Tiles cut from an untiled neighbour matrix only when they are used, for long lists (the
     60 bohr two-body list of a whole batch): no tiled copies and no displacement vectors of the
     whole list; the kernel builds each tile's vectors from positions, indices and shifts. Each
-    tile is a (B, T) copy, padded where the rows or the width run out."""
+    tile is a (B, T) copy, padded where the rows or the width run out.
+
+    With ``min_tile``, each block gets its own width: the smallest power-of-two multiple of
+    ``min_tile`` that holds its longest list, at most ``tile`` (a block of small molecules then
+    gets a narrow tile; the kernel must then treat the width as a dynamic dimension)."""
 
     block: int
     tile: int
     nl: NeighborMatrix  # (N, M), any width; rows beyond N are empty
     centres: Tensor  # (blocks, B) atom index of the centres
     counts: list[int]  # per block, the longest neighbour list
+    widths: list[int] | None = None  # per block, the tile width (None: ``tile`` everywhere)
     vectors = None  # the kernel computes its own
 
+    def width(self, kb: int) -> int:
+        return self.tile if self.widths is None else self.widths[kb]
+
     @classmethod
-    def build(cls, nl: NeighborMatrix, n_padded: int, block: int, tile: int) -> "SliceLayout":
+    def build(
+        cls, nl: NeighborMatrix, n_padded: int, block: int, tile: int, min_tile: int | None = None
+    ) -> "SliceLayout":
         """``nl`` with N rows (any width) for a system padded to ``n_padded`` rows."""
         count = torch.nn.functional.pad(nl.count, (0, n_padded - nl.n_atoms))
-        counts = count.reshape(-1, block).amax(1).cpu().tolist()
+        counts = [int(c) for c in count.reshape(-1, block).amax(1).cpu().tolist()]
         centres = torch.arange(n_padded, device=nl.indices.device).reshape(-1, block)
-        return cls(block, tile, nl, centres, [int(c) for c in counts])
+        widths = None
+        if min_tile is not None:
+            widths = []
+            for c in counts:
+                w = min(min_tile, tile)
+                while w < c and w < tile:
+                    w = min(2 * w, tile)
+                widths.append(w)
+        return cls(block, tile, nl, centres, counts, widths)
 
     def entries(self, x: Tensor, kb: int, p: int, fill: float | bool) -> Tensor:
         """Tile p of centre block kb of a per-entry table (N, M, ...) as a (B, T, ...) copy."""
-        r0, c0 = kb * self.block, p * self.tile
-        part = x[r0 : r0 + self.block, c0 : c0 + self.tile]
-        dr, dc = self.block - part.shape[0], self.tile - part.shape[1]
+        width = self.width(kb)
+        r0, c0 = kb * self.block, p * width
+        part = x[r0 : r0 + self.block, c0 : c0 + width]
+        dr, dc = self.block - part.shape[0], width - part.shape[1]
         if dr or dc:
             pad = (0, 0) * (x.dim() - 2) + (0, dc, 0, dr)
             return torch.nn.functional.pad(part, pad, value=fill)
@@ -182,7 +204,7 @@ def run_tiles(
             torch._dynamo.mark_dynamic(x, d)
     track = isinstance(acc, tuple) or acc.dim() > 0
     for kb in range(-(-n // layout.block)):
-        n_tiles = -(-layout.counts[kb] // layout.tile)
+        n_tiles = -(-layout.counts[kb] // layout.width(kb))
         for tiles in combinations_with_replacement(range(n_tiles), order):
             inputs = make_inputs(layout, kb, tiles)
             if track:

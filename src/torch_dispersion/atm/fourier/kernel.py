@@ -65,7 +65,7 @@ def _sw_all(x) -> Tensor:
 def sr_tile_energy(
     v_n: Tensor, v_m: Tensor, c6: Tensor, a: Tensor, t: TileInputs, s: SRScalars
 ) -> Tensor:
-    x = _terms(v_n, v_m, c6, t, s.base)
+    x, inv_c6_jk = _terms(v_n, v_m, c6, t, s.base)
     k_cp = _cp_prefactor(a, t, s.mu)[0]
     e_cp = torch.where(x.valid, (s.base.s9 / 3.0) * k_cp * x.ang * _sw_all(x), 0.0)
     return (x.e - e_cp).to(torch.float64).sum()
@@ -94,7 +94,7 @@ def _sr_pointwise(
     K = k_D3 fdmp - k_CP (the damping derivative keeps k_D3); q = s9/3 ang s is the
     derivative of e_CP with respect to sum_r mu_r a a a.
     """
-    x = _terms(v_n, v_m, c6, t, s.base)
+    x, inv_c6_jk = _terms(v_n, v_m, c6, t, s.base)
     k_raw = _cp_prefactor(a, t, s.mu)[0]
     k_cp = (s.base.s9 / 3.0) * k_raw
     a_, b_, c_ = x.u_ij[:, :, None], x.u_ik[:, None, :], x.u_jk
@@ -119,7 +119,7 @@ def _sr_pointwise(
         grads.append(torch.where(x.valid, de, 0.0))
     q = torch.where(x.valid, (s.base.s9 / 3.0) * x.ang * sw, 0.0)
     e_cp = k_raw * q
-    return x.e, e_cp, grads[0], grads[1], grads[2], 0.5 * x.e * x.inv_c6_jk, q
+    return x.e, e_cp, grads[0], grads[1], grads[2], 0.5 * x.e * inv_c6_jk, q
 
 
 def _sr_reduce(
