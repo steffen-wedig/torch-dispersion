@@ -173,6 +173,12 @@ class D4Settings(_EvalSettings):
     pair_tile_size: int = Field(default=4096, gt=0)
     """Neighbour tile width of the two-body kernel (``pair_block_size`` x ``pair_tile_size``
     pairs per call)."""
+    min_neighbor_tile_size: int = Field(default=32, gt=0)
+    """Narrowest ATM tile. Each centre block gets the smallest power-of-two multiple of this
+    that holds its longest neighbour list, at most ``neighbor_tile_size``, so blocks of small
+    molecules do not pay for 512-wide tiles. Full-width tiles run a compiled graph with a static
+    width, and all narrower widths share one graph with a dynamic width. Set it equal to
+    ``neighbor_tile_size`` for one tile width everywhere."""
 
     @classmethod
     def from_functional(cls, name: str, atm: bool = True, **overrides: Any) -> "D4Settings":

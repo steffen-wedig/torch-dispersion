@@ -11,9 +11,9 @@ ATM term (``core.chain``), with every stage working on the whole batch at once:
    reference weights -> C6(q) (two-body) and C6(q = 0) (ATM) as per-system blocks
    (S, n_max, n_max);
 2. tile stage on detached C6: the two-body pair tiles run over all atoms of the batch at once
-   (the kernel reads each pair's C6 from its system's block); the ATM triple tiles, when
-   s9 != 0, run system by system on that system's C6(q = 0) block. Both return their energy and
-   their gradients with respect to the displacement vectors and to C6;
+   (the kernel reads each pair's C6 from its system's block), and so do the ATM triple tiles
+   when s9 != 0 (``atm.flat``, on the C6(q = 0) blocks, per-pair gradients). Both return their
+   energy and their gradients with respect to the positions, the strain and C6;
 3. one ``torch.autograd.grad`` through both C6 adds the CN and charge contributions.
 
 Internally everything is in bohr and Hartree; the API takes and returns Å and eV. The EEQ stage
@@ -26,18 +26,12 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from ..atm.kernel import KernelParams, get_step_fn, triple_inputs
+from ..atm.flat import c6_tables, flat_inputs, flat_scalars, get_flat_step_fn
 from ..core.batch import Batch, pad_to_systems
 from ..core.chain import Strained, close_chain, forces_and_stress, graph_fn, strained
 from ..core.inputs import check_coincident, check_numbers, check_pbc, to_bohr
 from ..core.padding import CN_WIDTH_MULTIPLE, pad_numbers, pad_positions, padded_size
-from ..core.tiles import (
-    Accumulators,
-    SliceLayout,
-    TileLayout,
-    run_tiles,
-    zero_energy_or_accumulators,
-)
+from ..core.tiles import Accumulators, SliceLayout, run_tiles, zero_energy_or_accumulators
 from ..neighbors import NeighborMatrix, build_flat
 from ..pairwise.rational import get_pair_step_fn, pair_inputs, pair_scalars, rational_tables
 from ..settings import D4Settings
@@ -396,7 +390,7 @@ def _evaluate(
             total_charge,
         )  # fmt: skip
 
-    # stage 2: blocked two-body pairs (whole batch) and ATM triples (per system), detached C6
+    # stage 2: blocked two-body pairs and ATM triples over the whole batch, detached C6
     pos_d = pad_positions(geometry.positions.detach(), n_padded)
     cells_d = None if geometry.cell is None else geometry.cell.detach()
     rows_d = None if cells_d is None else cells_d[system_rows]
@@ -420,29 +414,18 @@ def _evaluate(
         else:
             e2 = acc2
     if terms.three_body:
-        nl3 = restricted(settings.three_body_cutoff_bohr)
-        energies = []
-        for s, (start, n_s) in enumerate(_ranges(batch.counts)):
-            c6_block = c6_0[s, :n_s, :n_s]
-            acc3 = _three_body(
-                c6_block.detach(),
-                pos_d[start : start + n_s],
-                None if cells_d is None else cells_d[s],
-                nl3.rows(start, n_s),
-                tables.numbers[start : start + n_s],
-                settings,
-                data,
-                need_grad,
-            )
-            if isinstance(acc3, Accumulators):
-                energies.append(acc3.energy)
-                explicit_pos[start : start + n_s] += acc3.grad_pos[:n_s]
-                explicit_virial[s] += acc3.virial
-                outputs.append(c6_block)
-                grad_outputs.append(acc3.grad_c6[:n_s, :n_s])
-            else:
-                energies.append(acc3)
-        e3 = torch.stack(energies)
+        acc3 = _three_body(
+            c6_0.detach(), pos_d, rows_d, system_rows, local_rows, batch, tables,
+            restricted(settings.three_body_cutoff_bohr), settings, data, need_grad,
+        )  # fmt: skip
+        if isinstance(acc3, Accumulators):
+            e3 = acc3.energy
+            explicit_pos = explicit_pos + acc3.grad_pos[:n]
+            explicit_virial = explicit_virial + acc3.virial
+            outputs.append(c6_0)
+            grad_outputs.append(acc3.grad_c6.view_as(c6_0))
+        else:
+            e3 = acc3
 
     hartree = settings.hartree_in_ev
     forces = stress = virial = None
@@ -459,12 +442,6 @@ def _evaluate(
         three_body_energy=e3 * hartree,
         charges=q.detach().to(f64),
     )
-
-
-def _ranges(counts: Sequence[int]) -> list[tuple[int, int]]:
-    """(first atom, atom count) of each system."""
-    starts = [sum(counts[:s]) for s in range(len(counts))]
-    return list(zip(starts, counts, strict=True))
 
 
 def _graph_stage(
@@ -577,37 +554,46 @@ def _two_body(
 
 def _three_body(
     c6: Tensor,
-    pos: Tensor,
-    cell: Tensor | None,
+    pos_d: Tensor,
+    rows_d: Tensor | None,
+    system_rows: Tensor,
+    local_rows: Tensor,
+    batch: Batch,
+    tables: _Tables,
     nl: NeighborMatrix,
-    numbers: Tensor,
     settings: D4Settings,
     data: D4ReferenceData,
     need_grad: bool,
 ):
-    """ATM tiles of one system on its detached C6(q = 0) block (n, n): energy () or
-    ``Accumulators`` of the system padded to the centre block size."""
+    """ATM tiles over all atoms of the batch on the detached C6(q = 0) blocks (S, n_max, n_max):
+    energy (S,) or ``Accumulators`` (per-system energy and virial, dE/dC6 flat). ``pos_d`` and
+    the row tables are padded to the centre block size, ``nl`` is the ATM list of the batch."""
     device, dtype = settings.torch_device, settings.torch_dtype
-    n = numbers.shape[0]
-    block, tile = settings.centre_block_size, settings.neighbor_tile_size
-    n_padded = padded_size(n, block)
-    nl = nl.pad(n_padded, tile)
-    z = torch.nn.functional.pad(numbers, (0, n_padded - n))
-    layout = TileLayout.build(nl, nl.vectors(pad_positions(pos, n_padded), cell), z, block, tile)
-    c6_p = torch.nn.functional.pad(c6, (0, n_padded - n, 0, n_padded - n))
+    n_padded = pos_d.shape[0]
+    cells = pos_d.new_zeros(n_padded, 3, 3) if rows_d is None else rows_d
+    layout = SliceLayout.build(
+        nl,
+        n_padded,
+        settings.centre_block_size,
+        settings.neighbor_tile_size,
+        settings.min_neighbor_tile_size,
+    )
     _, r0 = rational_tables(data.r4r2, settings.a1, settings.a2)
     # the kernel's exponent is (alpha + 2) / 3; D4 uses alp / 3
-    cutoff = settings.three_body_cutoff_bohr
-    scalars = KernelParams(s9=settings.s9, alpha=settings.alp - 2.0, cutoff=cutoff, width=0.0)
+    scalars = flat_scalars(
+        settings.s9, settings.alp - 2.0, settings.three_body_cutoff_bohr, 0.0, batch.n_max,
+        dtype, device,
+    )  # fmt: skip
+    sqrt_c6, inv_c6 = c6_tables(c6.reshape(-1))
     return run_tiles(
-        get_step_fn(need_grad, settings.compile, settings.kernel_gradient),
-        zero_energy_or_accumulators(need_grad, n_padded, device),
-        (c6_p,),
+        get_flat_step_fn(need_grad, settings.compile, settings.neighbor_tile_size),
+        zero_energy_or_accumulators(need_grad, n_padded, device, batch.n_systems, c6.numel()),
+        (sqrt_c6, inv_c6, pos_d, cells, tables.numbers, local_rows),
         layout,
-        n,
+        batch.n_atoms,
         2,
-        triple_inputs(r0),
-        scalars.scalars(dtype, device),
+        flat_inputs(r0, system_rows),
+        scalars,
     )
 
 

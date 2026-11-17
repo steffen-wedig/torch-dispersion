@@ -26,7 +26,7 @@ def reference_energy(
     width = torch.tensor(fs.short_range_width_bohr, dtype=torch.float64)
 
     def patched(v_n, v_m, c6, t, s):
-        x = orig(v_n, v_m, c6, t, s)
+        x, inv_c6_jk = orig(v_n, v_m, c6, t, s)
         dt = x.u_ij.dtype
         a_pad = torch.cat([a, a.new_zeros(c6.shape[0] - n, a.shape[1])]).to(dt)
         k_cp = torch.bmm(
@@ -39,7 +39,7 @@ def reference_energy(
         ]
         big_s = sw[0][:, :, None] * sw[1][:, None, :] * sw[2]
         e = torch.where(x.valid, (x.k * x.fdmp * big_s + k_cp * (1.0 - big_s)) * x.ang, 0.0)
-        return x._replace(e=e)
+        return x._replace(e=e), inv_c6_jk
 
     settings = ATMSettings(
         device=device,

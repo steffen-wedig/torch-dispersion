@@ -1,7 +1,11 @@
 # ATM gradients on pairs: dropping the far side of each triangle
 
-Status (2026-10-25): verified numerically, **not implemented**. This note is for later work on
-the ATM torch kernel (`atm/kernel.py`) and for the Triton ATM kernel.
+Status: verified numerically (2026-10-25). Implemented for D4 (2026-11-17) in the batch-wide
+ATM kernel `atm/flat.py`, which `tests/test_atm_flat.py` compares with the per-system kernel
+(energies to 1e-13, forces, virials and symmetrised dE/dC6 to 1e-11 relative). The D3 ATM
+(`atm/kernel.py`, `atm/realspace.py`) and the Fourier short-range kernel still use the
+per-system kernel with the far-side scatter. The note remains the reference for a Triton ATM
+kernel.
 
 ## The problem it solves
 

@@ -62,7 +62,7 @@ def instrument() -> None:
     eeq.wigner_seitz_images = timed("EEQ setup: Wigner-Seitz pairs", eeq.wigner_seitz_images)
     eeq.direct_coulomb = timed("EEQ direct Coulomb forward", eeq.direct_coulomb)
     d4._two_body = timed("two-body tiles (whole batch)", d4._two_body)
-    d4._three_body = timed("ATM tiles (per system)", d4._three_body)
+    d4._three_body = timed("ATM tiles (whole batch)", d4._three_body)
     d4.close_chain = timed("chain closure", d4.close_chain)
 
 
@@ -90,21 +90,34 @@ def small_cells(n: int) -> list:
     return cells
 
 
+def monomers(n: int) -> list:
+    """n fixture monomers (10-19 atoms, neutral), molecules without PBC."""
+    pool = [a for a in read(FIXTURES / "structures.extxyz", ":") if "_monomer" in a.info["name"]]
+    pool = [a for a in pool if "emim" not in a.info["name"]]  # the ions (charged)
+    out = []
+    for k in range(n):
+        atoms = pool[k % len(pool)].copy()
+        atoms.pbc = False
+        out.append(atoms)
+    return out
+
+
 def to_inputs(atoms_list):
     numbers = torch.cat([torch.tensor(a.numbers) for a in atoms_list])
     positions = torch.cat([torch.tensor(a.positions) for a in atoms_list])
-    cells = torch.stack([torch.tensor(a.cell.array) for a in atoms_list])
-    return numbers, positions, cells, [len(a) for a in atoms_list]
+    pbc = bool(atoms_list[0].pbc.all())
+    cells = torch.stack([torch.tensor(a.cell.array) for a in atoms_list]) if pbc else None
+    return numbers, positions, cells, pbc, [len(a) for a in atoms_list]
 
 
-def profile(atoms_list, s9: float, repeats: int) -> dict[str, Any]:
+def profile(atoms_list, s9: float, repeats: int, functional: str) -> dict[str, Any]:
     settings = D4Settings.from_functional(
-        "r2scan", s9=s9, device="cuda", compile=True, neighbor_backend=NvalchemiNeighbors()
+        functional, s9=s9, device="cuda", compile=True, neighbor_backend=NvalchemiNeighbors()
     )
-    numbers, positions, cells, counts = to_inputs(atoms_list)
+    numbers, positions, cells, pbc, counts = to_inputs(atoms_list)
 
     def call():
-        return d4_dispersion_batched(numbers, positions, cells, True, counts, settings)
+        return d4_dispersion_batched(numbers, positions, cells, pbc, counts, settings)
 
     call()  # warm-up and compilation
     torch.cuda.synchronize()
@@ -144,17 +157,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--functional", default="r2scan")
+    parser.add_argument("--batches", nargs="+", default=["md", "crystals", "small_cells"])
     args = parser.parse_args()
     instrument()
     batches = {
-        "li_diffusion MD shape (15 cells, 144-768 atoms)": (md_cells(), (0.0,)),
-        "fixture crystals (12 cells, 144-1000 atoms)": (build_batch(), (0.0, 1.0)),
-        "64 small cells (64 atoms)": (small_cells(64), (0.0, 1.0)),
+        "md": ("li_diffusion MD shape (15 cells, 144-768 atoms)", md_cells, (0.0,)),
+        "crystals": ("fixture crystals (12 cells, 144-1000 atoms)", build_batch, (0.0, 1.0)),
+        "small_cells": ("64 small cells (64 atoms)", lambda: small_cells(64), (0.0, 1.0)),
+        "monomers": ("64 molecules (10-19 atoms, no PBC)", lambda: monomers(64), (0.0, 1.0)),
     }
     results = []
-    for name, (atoms_list, s9_values) in batches.items():
+    for key in args.batches:
+        name, make, s9_values = batches[key]
+        atoms_list = make()
         for s9 in s9_values:
-            r: dict[str, Any] = profile(atoms_list, s9, args.repeats) | {"batch": name}
+            r: dict[str, Any] = profile(atoms_list, s9, args.repeats, args.functional)
+            r["batch"] = name
             results.append(r)
             print(
                 f"\n== {name}, s9 = {s9}: {r['total_s']:.3f} s, {r['atoms']} atoms, "

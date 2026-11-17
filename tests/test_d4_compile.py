@@ -151,7 +151,8 @@ def test_new_system_size_does_not_recompile(device):
     """After warm-up, cells with other atom counts, list widths and species compile no new
     graph: the graph-stage graphs are compiled with dynamic shapes from the start, the kernels
     have fixed tile shapes, and N is padded (``test_new_tile_shape_compiles_once`` shows the
-    counter does register new graphs)."""
+    counter does register new graphs). The per-block ATM tile widths are a dynamic dimension
+    of the ATM kernel (``test_atm_tile_widths_share_one_graph``)."""
     settings = make_d4_settings(device, compile=True, **SHORT)
     run_d4(random_cell(4, seed=1), settings)
     run_d4(random_cell(5, seed=2), settings)
@@ -165,9 +166,9 @@ def test_new_system_size_does_not_recompile(device):
 @pytest.mark.parametrize(
     ("field", "value", "graphs"),
     # the pair kernel is one graph, the analytic ATM kernel two (pointwise and reduction).
-    # Compiled kernels are cached process-wide, so the sizes must not occur in any other test
-    # (test_compile.py uses 96, test_blocking.py 32, 64 and 256; the default is 512).
-    [("pair_tile_size", 1024, 1), ("neighbor_tile_size", 80, 2)],
+    # Compiled kernels are cached process-wide, so the sizes must not occur in any other compiled
+    # test (test_compile.py uses neighbor_tile_size 96; the defaults are 4096 and 32).
+    [("pair_tile_size", 1024, 1), ("centre_block_size", 24, 2)],
 )
 def test_new_tile_shape_compiles_once(field, value, graphs, device):
     """A new kernel bucket compiles that kernel once and nothing else, for any system."""
@@ -178,3 +179,22 @@ def test_new_tile_shape_compiles_once(field, value, graphs, device):
     run_d4(atoms, settings)
     run_d4(random_cell(6, seed=6), settings)
     assert unique_graphs() - before == graphs
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_atm_tile_widths_share_one_graph(device):
+    """Per-block ATM tile widths: full-width tiles (``neighbor_tile_size``) run one static
+    graph pair, every narrower width (powers of two times ``min_neighbor_tile_size``) one
+    dynamic-width graph pair. Once both are compiled, new systems, new widths and a new
+    ``min_neighbor_tile_size`` compile nothing."""
+    # neighbor_tile_size 128 (no other compiled test uses it) keeps the full-width tiles cheap
+    tiles = {"neighbor_tile_size": 128}
+    settings = make_d4_settings(device, compile=True, **SHORT, **tiles)
+    run_d4(random_cell(2, seed=1), settings)  # narrow tiles only
+    run_d4(random_cell(12, seed=2), settings)  # ATM lists longer than 128: full width
+    before = unique_graphs()
+    for widths in ({"min_neighbor_tile_size": 24}, {}):
+        settings = make_d4_settings(device, compile=True, **SHORT, **tiles, **widths)
+        for n in (3, 5, 8, 11):
+            run_d4(random_cell(n, seed=n), settings)
+    assert unique_graphs() == before

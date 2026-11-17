@@ -18,7 +18,7 @@ Nomenclature follows simple-dftd3: ij = (i, n), ik = (i, m), jk = (n, m).
 
 from dataclasses import dataclass
 from functools import cache
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import torch
 from torch import Tensor
@@ -122,14 +122,34 @@ class _Terms(NamedTuple):
     inv_r3: Tensor  # 1 / (r_ij r_ik r_jk)^3
     inv_r5: Tensor
     sw: tuple[tuple[Tensor, Tensor], tuple[Tensor, Tensor], tuple[Tensor, Tensor]]
-    inv_c6_jk: Tensor  # 1 / C6_jk, 0 where C6 is below eps
     e: Tensor  # triangle energy including the 1/3, 0 where invalid
 
 
-def _terms(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars) -> _Terms:
-    """Shared forward pass. The expensive float64 special functions are factorised: the centre
-    legs are (B, T) work, 1/r1 needs one rsqrt per triangle, and sqrt(C6), 1/C6 are (Np, Np)
-    tables gathered per triangle. Only rsqrt, one pow and one division remain per triangle."""
+class TriangleScalars(Protocol):
+    """The scalars ``triangles`` and ``leg_derivatives`` read (``KernelScalars`` and the
+    flat kernel's ``FlatScalars`` both have them)."""
+
+    @property
+    def exponent(self) -> Tensor: ...  # (alpha + 2) / 3
+    @property
+    def cutoff(self) -> Tensor: ...
+    @property
+    def width(self) -> Tensor: ...
+
+
+def triangles(
+    v_n: Tensor,
+    v_m: Tensor,
+    mask_n: Tensor,
+    mask_m: Tensor,
+    diagonal: Tensor,
+    r0: Tensor,
+    k: Tensor,
+    s: TriangleScalars,
+) -> _Terms:
+    """The geometry of one tile's triangles (i, n, m) from the centre legs v_n, v_m (B, T, 3),
+    their masks, the damping radius product r0 (B, T, T) and the prefactor k = s9 sqrt(C6 C6
+    C6) / 3 (B, T, T). Only rsqrt, one pow and one division per triangle."""
     dtype = v_n.dtype
     eps = torch.finfo(dtype).eps
     cutoff2 = s.cutoff * s.cutoff
@@ -140,23 +160,12 @@ def _terms(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
     v_jk = v_m[:, None, :, :] - v_n[:, :, None, :]  # (B, T, T, 3)
     r2_jk = v_jk.square().sum(-1)
 
-    ok_ij = t.mask_n & (r2_ij <= cutoff2) & (r2_ij > eps)
-    ok_ik = t.mask_m & (r2_ik <= cutoff2) & (r2_ik > eps)
+    ok_ij = mask_n & (r2_ij <= cutoff2) & (r2_ij > eps)
+    ok_ik = mask_m & (r2_ik <= cutoff2) & (r2_ik > eps)
     ok_jk = (r2_jk <= cutoff2) & (r2_jk > eps)
     order = torch.arange(tile, device=v_n.device)
     upper = order[:, None] < order[None, :]
-    valid = ok_ij[:, :, None] & ok_ik[:, None, :] & ok_jk & (upper | ~t.diagonal)
-
-    # C6 tables: triangles with any |C6| < eps get k = 0 (they are skipped in simple-dftd3)
-    ok_c6 = c6.abs() >= eps
-    c6_safe = torch.where(ok_c6, c6, 1.0)
-    sqrt_c6 = torch.where(ok_c6, torch.sqrt(c6_safe.abs()), 0.0)
-    inv_c6 = torch.where(ok_c6, 1.0 / c6_safe, 0.0)
-    centre = t.centre[:, None]
-    jk = (t.idx_n[:, :, None], t.idx_m[:, None, :])
-    k = (s.s9 / 3.0) * (
-        sqrt_c6[centre, t.idx_n][:, :, None] * sqrt_c6[centre, t.idx_m][:, None, :] * sqrt_c6[jk]
-    )
+    valid = ok_ij[:, :, None] & ok_ik[:, None, :] & ok_jk & (upper | ~diagonal)
 
     u_ij = torch.where(ok_ij, r2_ij, 1.0)
     u_ik = torch.where(ok_ik, r2_ik, 1.0)
@@ -167,11 +176,6 @@ def _terms(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
     inv_r3 = inv_r2 * inv_r1
     inv_r5 = inv_r3 * inv_r2
 
-    r0 = (
-        t.r0[t.z_centre[:, None], t.z_n][:, :, None]
-        * t.r0[t.z_centre[:, None], t.z_m][:, None, :]
-        * t.r0[t.z_n[:, :, None], t.z_m[:, None, :]]
-    )
     tdmp = 6.0 * (r0 * inv_r1) ** s.exponent
     fdmp = 1.0 / (1.0 + tdmp)
     a, b = u_ij[:, :, None], u_ik[:, None, :]
@@ -198,14 +202,44 @@ def _terms(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
         inv_r3=inv_r3,
         inv_r5=inv_r5,
         sw=sw,
-        inv_c6_jk=inv_c6[jk],
         e=e,
     )
 
 
+def damping_radii(r0: Tensor, z_centre: Tensor, z_n: Tensor, z_m: Tensor) -> Tensor:
+    """(B, T, T) product of the three sides' damping radii from the (Z, Z) table."""
+    return (
+        r0[z_centre[:, None], z_n][:, :, None]
+        * r0[z_centre[:, None], z_m][:, None, :]
+        * r0[z_n[:, :, None], z_m[:, None, :]]
+    )
+
+
+def _terms(
+    v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
+) -> tuple[_Terms, Tensor]:
+    """Shared forward pass on one system's C6 (Np, Np): the triangle terms and 1/C6_jk (B, T, T;
+    0 where C6 is below eps). The expensive float64 special functions
+    are factorised: the centre legs are (B, T) work, 1/r1 needs one rsqrt per triangle, and
+    sqrt(C6), 1/C6 are (Np, Np) tables gathered per triangle."""
+    eps = torch.finfo(v_n.dtype).eps
+    # C6 tables: triangles with any |C6| < eps get k = 0 (they are skipped in simple-dftd3)
+    ok_c6 = c6.abs() >= eps
+    c6_safe = torch.where(ok_c6, c6, 1.0)
+    sqrt_c6 = torch.where(ok_c6, torch.sqrt(c6_safe.abs()), 0.0)
+    inv_c6 = torch.where(ok_c6, 1.0 / c6_safe, 0.0)
+    centre = t.centre[:, None]
+    jk = (t.idx_n[:, :, None], t.idx_m[:, None, :])
+    k = (s.s9 / 3.0) * (
+        sqrt_c6[centre, t.idx_n][:, :, None] * sqrt_c6[centre, t.idx_m][:, None, :] * sqrt_c6[jk]
+    )
+    r0 = damping_radii(t.r0, t.z_centre, t.z_n, t.z_m)
+    return triangles(v_n, v_m, t.mask_n, t.mask_m, t.diagonal, r0, k, s), inv_c6[jk]
+
+
 def tile_energy(v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars) -> Tensor:
     """ATM energy (Hartree, float64 scalar) of one tile. v_* (B, T, 3) bohr, c6 (Np, Np)."""
-    return _terms(v_n, v_m, c6, t, s).e.to(torch.float64).sum()
+    return _terms(v_n, v_m, c6, t, s)[0].e.to(torch.float64).sum()
 
 
 def tile_energy_and_grad_vjp(
@@ -222,20 +256,15 @@ def tile_energy_and_grad_vjp(
     return energy, g_n, g_m, g_c6
 
 
-def _analytic_pointwise(
-    v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Per-triangle (e, de/du_ij, de/du_ik, de/du_jk, de/dC6_jk), all (B, T, T).
+def leg_derivatives(x: _Terms, s: TriangleScalars, legs: tuple[int, ...]) -> list[Tensor]:
+    """de/du_p (B, T, T) of the legs ``legs`` (0 = ij, 1 = ik, 2 = jk), u the squared lengths.
 
-    With u the squared legs, e = k fdmp(W) ang(u) sw(u), W = u_ij u_ik u_jk:
+    With e = k fdmp(W) ang(u) sw(u), W = u_ij u_ik u_jk:
 
         d ang / du_p = 3/8 dN/du_p W^-5/2 - (15/16 N W^-5/2 + 3/2 W^-3/2) / u_p
         d fdmp / du_p = fdmp^2 tdmp (alpha + 2) / 6 / u_p
 
-    (N is the product of the three law-of-cosines factors), and e ~ sqrt(C6_ij C6_ik C6_jk)
-    gives de/dC6_x = e / (2 C6_x).
-    """
-    x = _terms(v_n, v_m, c6, t, s)
+    (N is the product of the three law-of-cosines factors)."""
     a, b, c = x.u_ij[:, :, None], x.u_ik[:, None, :], x.u_jk
     l1, l2, l3 = a + c - b, a - c + b, -a + c + b
     dn = (
@@ -253,11 +282,21 @@ def _analytic_pointwise(
     inv_u = (x.inv_u_ij[:, :, None], x.inv_u_ik[:, None, :], x.inv_u_jk)
     fa = x.fdmp * x.ang
     grads = []
-    for p in range(3):
+    for p in legs:
         dang = 0.375 * dn[p] * x.inv_r5 - common * inv_u[p]
         de = x.k * (sw * ((dfd * x.ang) * inv_u[p] + x.fdmp * dang) + fa * sw_d[p])
         grads.append(torch.where(x.valid, de, 0.0))
-    return x.e, grads[0], grads[1], grads[2], 0.5 * x.e * x.inv_c6_jk
+    return grads
+
+
+def _analytic_pointwise(
+    v_n: Tensor, v_m: Tensor, c6: Tensor, t: TileInputs, s: KernelScalars
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Per-triangle (e, de/du_ij, de/du_ik, de/du_jk, de/dC6_jk), all (B, T, T); e ~
+    sqrt(C6_ij C6_ik C6_jk) gives de/dC6_x = e / (2 C6_x)."""
+    x, inv_c6_jk = _terms(v_n, v_m, c6, t, s)
+    g_ij, g_ik, g_jk = leg_derivatives(x, s, (0, 1, 2))
+    return x.e, g_ij, g_ik, g_jk, 0.5 * x.e * inv_c6_jk
 
 
 def _analytic_reduce(

@@ -47,7 +47,7 @@ def instrument() -> None:
     d4.check_coincident = watched("coincidence check", d4.check_coincident)
     d4._graph_stage = watched("graph stage forward", d4._graph_stage)
     d4._two_body = watched("two-body tiles", d4._two_body)
-    d4.TileLayout.build = watched("  tile layout build", d4.TileLayout.build)
+    d4._three_body = watched("ATM tiles", d4._three_body)
     d4.run_tiles = watched("  tile loop", d4.run_tiles)
     d4.close_chain = watched("chain closure (backward)", d4.close_chain)
 
